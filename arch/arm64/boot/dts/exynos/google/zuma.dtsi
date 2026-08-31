@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Zuma SoC
+ *
+ * Initial description limited to hardware needed for architectural boot.
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	compatible = "google,zuma";
+	#address-cells = <2>;
+	#size-cells = <1>;
+
+	interrupt-parent = <&gic>;
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			compatible = "arm,cortex-a510";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x000>;
+		};
+
+		cpu1: cpu@100 {
+			compatible = "arm,cortex-a510";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x100>;
+		};
+
+		cpu2: cpu@200 {
+			compatible = "arm,cortex-a510";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x200>;
+		};
+
+		cpu3: cpu@300 {
+			compatible = "arm,cortex-a510";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x300>;
+		};
+
+		cpu4: cpu@400 {
+			compatible = "arm,cortex-a715";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x400>;
+		};
+
+		cpu5: cpu@500 {
+			compatible = "arm,cortex-a715";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x500>;
+		};
+
+		cpu6: cpu@600 {
+			compatible = "arm,cortex-a715";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x600>;
+		};
+
+		cpu7: cpu@700 {
+			compatible = "arm,cortex-a715";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x700>;
+		};
+
+		cpu8: cpu@800 {
+			compatible = "arm,cortex-x3";
+			device_type = "cpu";
+			enable-method = "psci";
+			reg = <0x0 0x800>;
+		};
+	};
+
+	/* The bootloader requires this node. */
+	ect {
+	};
+
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW &ppi_all>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW &ppi_all>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW &ppi_all>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW &ppi_all>,
+			     <GIC_PPI 12 IRQ_TYPE_LEVEL_LOW &ppi_all>;
+		clock-frequency = <24576000>;
+	};
+
+	soc: soc@0 {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x0 0x0 0x40000000>;
+
+		gic: interrupt-controller@10400000 {
+			compatible = "arm,gic-v3";
+			#address-cells = <0>;
+			#interrupt-cells = <4>;
+			interrupt-controller;
+			reg = <0x10400000 0x10000>,
+			      <0x10440000 0x200000>;
+			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH &ppi_all>;
+
+			ppi-partitions {
+				ppi_all: interrupt-partition-0 {
+					affinity = <&cpu0>, <&cpu1>, <&cpu2>,
+						   <&cpu3>, <&cpu4>, <&cpu5>,
+						   <&cpu6>, <&cpu7>, <&cpu8>;
+				};
+			};
+		};
+	};
+};

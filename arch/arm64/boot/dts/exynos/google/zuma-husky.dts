@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Pixel 8 Pro (Husky)
+ *
+ * Initial description limited to hardware needed for architectural boot.
+ */
+
+/dts-v1/;
+
+#include "zuma.dtsi"
+
+/ {
+	model = "Google Pixel 8 Pro";
+	compatible = "google,zuma-husky", "google,zuma";
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x80000000>;
+	};
+
+	memory@880000000 {
+		device_type = "memory";
+		reg = <0x8 0x80000000 0x80000000>;
+	};
+
+	memory@900000000 {
+		device_type = "memory";
+		reg = <0x9 0x00000000 0x80000000>;
+	};
+
+	memory@980000000 {
+		device_type = "memory";
+		reg = <0x9 0x80000000 0x80000000>;
+	};
+
+	memory@a00000000 {
+		device_type = "memory";
+		reg = <0xa 0x00000000 0x80000000>;
+	};
+
+	memory@a80000000 {
+		device_type = "memory";
+		reg = <0xa 0x80000000 0x68ba2000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <1>;
+		ranges;
+
+		pkvm-guest-firmware@8b000000 {
+			reg = <0x0 0x8b000000 0x000c0000>;
+			no-map;
+		};
+
+		ect@90000000 {
+			reg = <0x0 0x90000000 0x00060000>;
+			no-map;
+		};
+
+		gsa-protected@90200000 {
+			reg = <0x0 0x90200000 0x003ff000>;
+			no-map;
+		};
+
+		gsa-unprotected@905ff000 {
+			reg = <0x0 0x905ff000 0x00001000>;
+			no-map;
+		};
+
+		gxp-scratchpad@91300000 {
+			reg = <0x0 0x91300000 0x00060000>;
+			no-map;
+		};
+
+		iif-wait-table@91360000 {
+			reg = <0x0 0x91360000 0x00020000>;
+			no-map;
+		};
+
+		iif-signal-table@91380000 {
+			reg = <0x0 0x91380000 0x00020000>;
+			no-map;
+		};
+
+		gxp-secure-data@91400000 {
+			reg = <0x0 0x91400000 0x00900000>;
+			no-map;
+		};
+
+		gxp-firmware@91d00000 {
+			reg = <0x0 0x91d00000 0x00300000>;
+			no-map;
+		};
+
+		gxp-mcu-firmware@92000000 {
+			reg = <0x0 0x92000000 0x00400000>;
+			no-map;
+		};
+
+		tpu-firmware@93000000 {
+			reg = <0x0 0x93000000 0x01000000>;
+			no-map;
+		};
+
+		aoc@94000000 {
+			reg = <0x0 0x94000000 0x03000000>;
+			no-map;
+		};
+
+		xhci-dma@97000000 {
+			reg = <0x0 0x97000000 0x00400000>;
+			no-map;
+		};
+
+		secure-dram@b6200000 {
+			reg = <0x0 0xb6200000 0x09e00000>;
+			no-map;
+		};
+
+		secure-log@c3000000 {
+			reg = <0x0 0xc3000000 0x00090000>;
+			no-map;
+		};
+
+		debug-header@d8100000 {
+			reg = <0x0 0xd8100000 0x00010000>;
+			no-map;
+		};
+
+		kernel-events-log@d8110000 {
+			reg = <0x0 0xd8110000 0x00700000>;
+			no-map;
+		};
+
+		s2d-log@d8810000 {
+			reg = <0x0 0xd8810000 0x01800000>;
+			no-map;
+		};
+
+		reset-log@da010000 {
+			reg = <0x0 0xda010000 0x00a00000>;
+			no-map;
+		};
+
+		panic-log@daa10000 {
+			reg = <0x0 0xdaa10000 0x00a00000>;
+			no-map;
+		};
+
+		slcdump-log@db410000 {
+			reg = <0x0 0xdb410000 0x01100000>;
+			no-map;
+		};
+
+		pre-slcdump-log@dc510000 {
+			reg = <0x0 0xdc510000 0x01100000>;
+			no-map;
+		};
+
+		bcm-log@dd610000 {
+			reg = <0x0 0xdd610000 0x00400000>;
+			no-map;
+		};
+
+		itmon-log@dda10000 {
+			reg = <0x0 0xdda10000 0x00010000>;
+			no-map;
+		};
+
+		s2d-extract-log@dda20000 {
+			reg = <0x0 0xdda20000 0x00600000>;
+			no-map;
+		};
+
+		secure-page-tables@e0000000 {
+			reg = <0x0 0xe0000000 0x03800000>;
+			no-map;
+		};
+
+		modem@e8000000 {
+			reg = <0x0 0xe8000000 0x02000000>;
+			no-map;
+		};
+
+		modem@ea400000 {
+			reg = <0x0 0xea400000 0x00c00000>;
+			no-map;
+		};
+
+		modem-msi@f6200000 {
+			reg = <0x0 0xf6200000 0x00001000>;
+			no-map;
+		};
+
+		abl@f8800000 {
+			reg = <0x0 0xf8800000 0x01000000>;
+			no-map;
+		};
+
+		dss-log@fd3f0000 {
+			reg = <0x0 0xfd3f0000 0x0000e000>;
+			no-map;
+		};
+
+		debug-kinfo@fd3fe000 {
+			reg = <0x0 0xfd3fe000 0x00001000>;
+			no-map;
+		};
+
+		ramoops@fd3ff000 {
+			compatible = "ramoops";
+			reg = <0x0 0xfd3ff000 0x00400000>;
+			console-size = <0x00200000>;
+			pmsg-size = <0x00200000>;
+		};
+
+		bootloader-log@fd800000 {
+			reg = <0x0 0xfd800000 0x00100000>;
+			no-map;
+		};
+	};
+};
