@@ -73,10 +73,12 @@ static int __init zuma_usb_handoff_fixup(void)
 	/* These downstream suppliers do not exist in mainline yet. */
 	zuma_usb_remove_property(glue, "clocks");
 	zuma_usb_remove_property(glue, "power-domains");
+	zuma_usb_remove_property(glue, "extcon");
 	zuma_usb_remove_property(dwc3, "iommus");
 	zuma_usb_remove_property(dwc3, "memory-region");
 	zuma_usb_remove_property(phy, "clocks");
 	zuma_usb_remove_property(phy, "power-domains");
+	zuma_usb_remove_property(phy, "extcon");
 	zuma_usb_remove_property(phy, "s2mpus");
 
 	of_update_property(glue, &zuma_usb_glue_handoff_property);
