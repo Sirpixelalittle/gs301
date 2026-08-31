@@ -15,6 +15,8 @@
 #include <linux/clk.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/mfd/syscon.h>
+#include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
 #define DWC3_EXYNOS_MAX_CLOCKS	4
@@ -23,6 +25,8 @@ struct dwc3_exynos_driverdata {
 	const char		*clk_names[DWC3_EXYNOS_MAX_CLOCKS];
 	int			num_clks;
 	int			suspend_clk_idx;
+	bool			skip_regulators;
+	bool			check_zuma_hsi0;
 };
 
 struct dwc3_exynos {
@@ -32,10 +36,37 @@ struct dwc3_exynos {
 	struct clk		*clks[DWC3_EXYNOS_MAX_CLOCKS];
 	int			num_clks;
 	int			suspend_clk_idx;
+	bool			skip_regulators;
 
 	struct regulator	*vdd33;
 	struct regulator	*vdd10;
 };
+
+#define ZUMA_HSI0_STATUS	0x2a84
+
+static int dwc3_exynos_check_zuma_hsi0(struct device *dev)
+{
+	struct regmap *pmu;
+	unsigned int status;
+	int ret;
+
+	pmu = syscon_regmap_lookup_by_compatible("samsung,gs101-pmu");
+	if (IS_ERR(pmu))
+		return dev_err_probe(dev, PTR_ERR(pmu),
+				     "failed to find Zuma PMU syscon\n");
+
+	ret = regmap_read(pmu, ZUMA_HSI0_STATUS, &status);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to read HSI0 status\n");
+
+	if (!(status & BIT(0))) {
+		dev_warn(dev, "HSI0 is off; refusing unsafe USB MMIO handoff\n");
+		return -ENODEV;
+	}
+
+	dev_info(dev, "HSI0 is on; accepting guarded bootloader handoff\n");
+	return 0;
+}
 
 static int dwc3_exynos_probe(struct platform_device *pdev)
 {
@@ -54,6 +85,17 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 	exynos->num_clks = driver_data->num_clks;
 	exynos->clk_names = (const char **)driver_data->clk_names;
 	exynos->suspend_clk_idx = driver_data->suspend_clk_idx;
+	exynos->skip_regulators = driver_data->skip_regulators;
+
+	if (driver_data->check_zuma_hsi0) {
+		if (!of_property_read_bool(node,
+					   "google,bootloader-usb-handoff"))
+			return -ENODEV;
+
+		ret = dwc3_exynos_check_zuma_hsi0(dev);
+		if (ret)
+			return ret;
+	}
 
 	platform_set_drvdata(pdev, exynos);
 
@@ -78,26 +120,28 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 	if (exynos->suspend_clk_idx >= 0)
 		clk_prepare_enable(exynos->clks[exynos->suspend_clk_idx]);
 
-	exynos->vdd33 = devm_regulator_get(dev, "vdd33");
-	if (IS_ERR(exynos->vdd33)) {
-		ret = PTR_ERR(exynos->vdd33);
-		goto vdd33_err;
-	}
-	ret = regulator_enable(exynos->vdd33);
-	if (ret) {
-		dev_err(dev, "Failed to enable VDD33 supply\n");
-		goto vdd33_err;
-	}
+	if (!exynos->skip_regulators) {
+		exynos->vdd33 = devm_regulator_get(dev, "vdd33");
+		if (IS_ERR(exynos->vdd33)) {
+			ret = PTR_ERR(exynos->vdd33);
+			goto vdd33_err;
+		}
+		ret = regulator_enable(exynos->vdd33);
+		if (ret) {
+			dev_err(dev, "Failed to enable VDD33 supply\n");
+			goto vdd33_err;
+		}
 
-	exynos->vdd10 = devm_regulator_get(dev, "vdd10");
-	if (IS_ERR(exynos->vdd10)) {
-		ret = PTR_ERR(exynos->vdd10);
-		goto vdd10_err;
-	}
-	ret = regulator_enable(exynos->vdd10);
-	if (ret) {
-		dev_err(dev, "Failed to enable VDD10 supply\n");
-		goto vdd10_err;
+		exynos->vdd10 = devm_regulator_get(dev, "vdd10");
+		if (IS_ERR(exynos->vdd10)) {
+			ret = PTR_ERR(exynos->vdd10);
+			goto vdd10_err;
+		}
+		ret = regulator_enable(exynos->vdd10);
+		if (ret) {
+			dev_err(dev, "Failed to enable VDD10 supply\n");
+			goto vdd10_err;
+		}
 	}
 
 	if (node) {
@@ -115,9 +159,11 @@ static int dwc3_exynos_probe(struct platform_device *pdev)
 	return 0;
 
 populate_err:
-	regulator_disable(exynos->vdd10);
+	if (!exynos->skip_regulators)
+		regulator_disable(exynos->vdd10);
 vdd10_err:
-	regulator_disable(exynos->vdd33);
+	if (!exynos->skip_regulators)
+		regulator_disable(exynos->vdd33);
 vdd33_err:
 	for (i = exynos->num_clks - 1; i >= 0; i--)
 		clk_disable_unprepare(exynos->clks[i]);
@@ -141,9 +187,18 @@ static void dwc3_exynos_remove(struct platform_device *pdev)
 	if (exynos->suspend_clk_idx >= 0)
 		clk_disable_unprepare(exynos->clks[exynos->suspend_clk_idx]);
 
-	regulator_disable(exynos->vdd33);
-	regulator_disable(exynos->vdd10);
+	if (!exynos->skip_regulators) {
+		regulator_disable(exynos->vdd33);
+		regulator_disable(exynos->vdd10);
+	}
 }
+
+static const struct dwc3_exynos_driverdata zuma_handoff_drvdata = {
+	.num_clks = 0,
+	.suspend_clk_idx = -1,
+	.skip_regulators = true,
+	.check_zuma_hsi0 = true,
+};
 
 static const struct dwc3_exynos_driverdata exynos2200_drvdata = {
 	.clk_names = { "link_aclk" },
@@ -195,6 +250,9 @@ static const struct dwc3_exynos_driverdata exynosautov920_drvdata = {
 
 static const struct of_device_id exynos_dwc3_match[] = {
 	{
+		.compatible = "samsung,exynos9-dwusb",
+		.data = &zuma_handoff_drvdata,
+	}, {
 		.compatible = "samsung,exynos2200-dwusb3",
 		.data = &exynos2200_drvdata,
 	}, {
@@ -231,8 +289,10 @@ static int dwc3_exynos_suspend(struct device *dev)
 	for (i = exynos->num_clks - 1; i >= 0; i--)
 		clk_disable_unprepare(exynos->clks[i]);
 
-	regulator_disable(exynos->vdd33);
-	regulator_disable(exynos->vdd10);
+	if (!exynos->skip_regulators) {
+		regulator_disable(exynos->vdd33);
+		regulator_disable(exynos->vdd10);
+	}
 
 	return 0;
 }
@@ -242,15 +302,17 @@ static int dwc3_exynos_resume(struct device *dev)
 	struct dwc3_exynos *exynos = dev_get_drvdata(dev);
 	int i, ret;
 
-	ret = regulator_enable(exynos->vdd33);
-	if (ret) {
-		dev_err(dev, "Failed to enable VDD33 supply\n");
-		return ret;
-	}
-	ret = regulator_enable(exynos->vdd10);
-	if (ret) {
-		dev_err(dev, "Failed to enable VDD10 supply\n");
-		return ret;
+	if (!exynos->skip_regulators) {
+		ret = regulator_enable(exynos->vdd33);
+		if (ret) {
+			dev_err(dev, "Failed to enable VDD33 supply\n");
+			return ret;
+		}
+		ret = regulator_enable(exynos->vdd10);
+		if (ret) {
+			dev_err(dev, "Failed to enable VDD10 supply\n");
+			return ret;
+		}
 	}
 
 	for (i = 0; i < exynos->num_clks; i++) {

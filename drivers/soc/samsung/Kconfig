@@ -75,4 +75,14 @@ config SAMSUNG_PM_CHECK_CHUNKSIZE
 config EXYNOS_REGULATOR_COUPLER
 	bool "Exynos SoC Regulator Coupler" if COMPILE_TEST
 	depends on ARCH_EXYNOS || COMPILE_TEST
+
+config EXYNOS_ZUMA_USB_HANDOFF
+	bool "Google Zuma USB bootloader handoff"
+	depends on ARCH_EXYNOS && OF
+	help
+	  Apply the minimal live device-tree fixups needed to consume the
+	  shipping Google Zuma USB nodes while the upstream clock, power-domain
+	  and IOMMU providers are not available.  This is an awake, High-Speed
+	  gadget bring-up aid which relies on a powered fastboot handoff.
+
 endif

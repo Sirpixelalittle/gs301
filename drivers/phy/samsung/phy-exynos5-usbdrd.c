@@ -8,6 +8,7 @@
  * Author: Vivek Gautam <gautam.vivek@samsung.com>
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -57,6 +58,30 @@
 #define RES_TUNE_PHY1_PHY2			0x1
 #define RES_TUNE_PHY1				0x2
 #define RES_TUNE_PHY2				0x3
+
+/* Zuma eUSB2 controller registers (shipping resource 1). */
+#define ZUMA_EUSB_RST_CTRL			0x00
+#define ZUMA_EUSB_PHY_RESET			BIT(0)
+#define ZUMA_EUSB_PHY_RESET_OVERRIDE		BIT(1)
+#define ZUMA_EUSB_UTMI_PORT_RESET		BIT(4)
+#define ZUMA_EUSB_UTMI_PORT_RESET_OVERRIDE	BIT(5)
+#define ZUMA_EUSB_CMN_CTRL			0x04
+#define ZUMA_EUSB_PHY_ENABLE			BIT(0)
+#define ZUMA_EUSB_REF_FREQ_SEL			GENMASK(6, 4)
+#define ZUMA_EUSB_REPEATER_MODE			BIT(10)
+#define ZUMA_EUSB_PLLCFG0			0x08
+#define ZUMA_EUSB_PLL_FB_DIV			GENMASK(19, 8)
+#define ZUMA_EUSB_PLLCFG1			0x0c
+#define ZUMA_EUSB_PLL_REF_DIV			GENMASK(11, 8)
+#define ZUMA_EUSB_TXTUNE			0x14
+#define ZUMA_EUSB_TX_FSLS_VREF			GENMASK(2, 1)
+#define ZUMA_EUSB_TESTSE			0x20
+#define ZUMA_EUSB_TEST_IDDQ			BIT(6)
+
+#define ZUMA_HSI0_STATUS			0x2a84
+#define ZUMA_PMU_BASE				0x15460000
+#define ZUMA_SMC_PRIV_REG			0x82000504
+#define ZUMA_PRIV_REG_RMW			2
 
 /* Exynos5: USB 3.0 DRD PHY registers */
 #define EXYNOS5_DRD_LINKSYSTEM			0x04
@@ -203,6 +228,10 @@
 #define LINKCTRL_FORCE_RXELECIDLE		BIT(18)
 #define LINKCTRL_FORCE_PHYSTATUS		BIT(17)
 #define LINKCTRL_FORCE_PIPE_EN			BIT(16)
+#define LINKCTRL_DIS_QACT_LINKGATE		BIT(12)
+#define LINKCTRL_DIS_QACT_ID0			BIT(11)
+#define LINKCTRL_DIS_QACT_VBUS_VALID		BIT(10)
+#define LINKCTRL_DIS_QACT_BVALID		BIT(9)
 #define LINKCTRL_FORCE_QACT			BIT(8)
 #define LINKCTRL_BUS_FILTER_BYPASS		GENMASK(7, 4)
 
@@ -485,6 +514,7 @@ struct exynos5_usbdrd_phy_drvdata {
 	int n_core_clks;
 	const char * const *regulator_names;
 	int n_regulators;
+	bool zuma_handoff;
 	u32 pmu_offset_usbdrd0_phy;
 	u32 pmu_offset_usbdrd0_phy_ss;
 	u32 pmu_offset_usbdrd1_phy;
@@ -512,6 +542,7 @@ struct exynos5_usbdrd_phy_drvdata {
 struct exynos5_usbdrd_phy {
 	struct device *dev;
 	void __iomem *reg_phy;
+	void __iomem *reg_eusb;
 	void __iomem *reg_pcs;
 	void __iomem *reg_pma;
 	struct clk_bulk_data *clks;
@@ -1498,6 +1529,167 @@ static const struct phy_ops exynos2200_usbdrd_phy_ops = {
 	.owner		= THIS_MODULE,
 };
 
+static void zuma_usbdrd_write_mask(void __iomem *base, u32 offset,
+				   u32 mask, u32 value)
+{
+	u32 reg;
+
+	reg = readl(base + offset);
+	reg &= ~mask;
+	reg |= value & mask;
+	writel(reg, base + offset);
+}
+
+static void zuma_usbdrd_link_init(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *base = phy_drd->reg_phy;
+	u32 reg;
+
+	reg = readl(base + EXYNOS850_DRD_LINKCTRL);
+	reg |= LINKCTRL_DIS_QACT_ID0 | LINKCTRL_DIS_QACT_BVALID |
+	       LINKCTRL_DIS_QACT_VBUS_VALID | LINKCTRL_DIS_QACT_LINKGATE;
+	reg &= ~LINKCTRL_FORCE_QACT;
+	udelay(500);
+	writel(reg, base + EXYNOS850_DRD_LINKCTRL);
+	udelay(500);
+	reg |= LINKCTRL_FORCE_QACT;
+	reg &= ~LINKCTRL_BUS_FILTER_BYPASS;
+	reg |= FIELD_PREP(LINKCTRL_BUS_FILTER_BYPASS, 0xf);
+	writel(reg, base + EXYNOS850_DRD_LINKCTRL);
+
+	reg = readl(base + EXYNOS2200_DRD_CLKRST);
+	reg |= CLKRST_LINK_SW_RST;
+	writel(reg, base + EXYNOS2200_DRD_CLKRST);
+	udelay(10);
+	reg &= ~CLKRST_LINK_SW_RST;
+	writel(reg, base + EXYNOS2200_DRD_CLKRST);
+
+	reg = readl(base + EXYNOS2200_DRD_UTMI);
+	reg |= EXYNOS2200_UTMI_FORCE_BVALID |
+	       EXYNOS2200_UTMI_FORCE_VBUSVALID;
+	writel(reg, base + EXYNOS2200_DRD_UTMI);
+
+	/* Keep the unsupported SuperSpeed PHY detached for this HS-only port. */
+	reg = readl(base + EXYNOS850_DRD_LINKCTRL);
+	reg &= ~LINKCTRL_FORCE_PHYSTATUS;
+	reg |= LINKCTRL_FORCE_PIPE_EN | LINKCTRL_FORCE_RXELECIDLE;
+	writel(reg, base + EXYNOS850_DRD_LINKCTRL);
+
+	reg = readl(base + EXYNOS2200_DRD_CLKRST);
+	reg &= ~EXYNOS2200_CLKRST_LINK_PCLK_SEL;
+	writel(reg, base + EXYNOS2200_DRD_CLKRST);
+
+	reg = readl(base + EXYNOS2200_DRD_HSP_MISC);
+	reg &= ~HSP_MISC_RES_TUNE;
+	reg |= FIELD_PREP(HSP_MISC_RES_TUNE, RES_TUNE_PHY1);
+	reg |= HSP_MISC_SET_REQ_IN2;
+	writel(reg, base + EXYNOS2200_DRD_HSP_MISC);
+}
+
+static void zuma_usbdrd_eusb_init(struct exynos5_usbdrd_phy *phy_drd)
+{
+	void __iomem *base = phy_drd->reg_eusb;
+	u32 reg;
+
+	reg = readl(base + ZUMA_EUSB_RST_CTRL);
+	reg |= ZUMA_EUSB_PHY_RESET | ZUMA_EUSB_PHY_RESET_OVERRIDE |
+	       ZUMA_EUSB_UTMI_PORT_RESET |
+	       ZUMA_EUSB_UTMI_PORT_RESET_OVERRIDE;
+	writel(reg, base + ZUMA_EUSB_RST_CTRL);
+
+	reg = readl(base + ZUMA_EUSB_CMN_CTRL);
+	reg |= ZUMA_EUSB_REPEATER_MODE;
+	reg &= ~ZUMA_EUSB_REF_FREQ_SEL;
+	reg &= ~ZUMA_EUSB_PHY_ENABLE;
+	writel(reg, base + ZUMA_EUSB_CMN_CTRL);
+
+	zuma_usbdrd_write_mask(base, ZUMA_EUSB_PLLCFG0,
+			       ZUMA_EUSB_PLL_FB_DIV,
+			       FIELD_PREP(ZUMA_EUSB_PLL_FB_DIV, 368));
+	zuma_usbdrd_write_mask(base, ZUMA_EUSB_PLLCFG1,
+			       ZUMA_EUSB_PLL_REF_DIV, 0);
+	zuma_usbdrd_write_mask(base, ZUMA_EUSB_TXTUNE,
+			       ZUMA_EUSB_TX_FSLS_VREF, 0);
+	zuma_usbdrd_write_mask(base, ZUMA_EUSB_TESTSE,
+			       ZUMA_EUSB_TEST_IDDQ, 0);
+
+	udelay(10);
+	zuma_usbdrd_write_mask(base, ZUMA_EUSB_RST_CTRL,
+			       ZUMA_EUSB_PHY_RESET, 0);
+	udelay(10);
+	zuma_usbdrd_write_mask(base, ZUMA_EUSB_CMN_CTRL,
+			       ZUMA_EUSB_PHY_ENABLE,
+			       ZUMA_EUSB_PHY_ENABLE);
+
+	udelay(1000);
+	udelay(28);
+	udelay(2500);
+	zuma_usbdrd_write_mask(base, ZUMA_EUSB_RST_CTRL,
+			       ZUMA_EUSB_UTMI_PORT_RESET |
+			       ZUMA_EUSB_UTMI_PORT_RESET_OVERRIDE, 0);
+}
+
+static int zuma_usbdrd_pmu_enable_usb2(struct exynos5_usbdrd_phy *phy_drd,
+				       struct phy_usb_instance *inst)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(ZUMA_SMC_PRIV_REG,
+		      ZUMA_PMU_BASE + inst->pmu_offset,
+		      ZUMA_PRIV_REG_RMW, BIT(0), BIT(0), 0, 0, 0, &res);
+	if ((long)res.a0) {
+		dev_err(phy_drd->dev, "secure USB2 PMU enable failed: %ld\n",
+			(long)res.a0);
+		return (int)res.a0;
+	}
+
+	return 0;
+}
+
+static int zuma_usbdrd_phy_init(struct phy *phy)
+{
+	struct phy_usb_instance *inst = phy_get_drvdata(phy);
+	struct exynos5_usbdrd_phy *phy_drd = to_usbdrd_phy(inst);
+	unsigned int status;
+	int ret;
+
+	/* The second stock PHY specifier is retained only to satisfy DWC3. */
+	if (inst->index != EXYNOS5_DRDPHY_UTMI)
+		return 0;
+
+	ret = regmap_read(inst->reg_pmu, ZUMA_HSI0_STATUS, &status);
+	if (ret)
+		return ret;
+	if (!(status & BIT(0))) {
+		dev_warn(phy_drd->dev,
+			 "HSI0 turned off before PHY init; refusing USB MMIO\n");
+		return -ENODEV;
+	}
+
+	ret = zuma_usbdrd_pmu_enable_usb2(phy_drd, inst);
+	if (ret)
+		return ret;
+
+	dev_info(phy_drd->dev,
+		 "initializing Zuma 0x700 eUSB2 from powered bootloader handoff\n");
+	zuma_usbdrd_link_init(phy_drd);
+	zuma_usbdrd_eusb_init(phy_drd);
+
+	return 0;
+}
+
+static int zuma_usbdrd_phy_exit(struct phy *phy)
+{
+	/* Keep the bootloader-owned rails, clocks and HSI0 domain enabled. */
+	return 0;
+}
+
+static const struct phy_ops zuma_usbdrd_phy_ops = {
+	.init		= zuma_usbdrd_phy_init,
+	.exit		= zuma_usbdrd_phy_exit,
+	.owner		= THIS_MODULE,
+};
+
 static void
 exynos5_usbdrd_usb_v3p1_pipe_override(struct exynos5_usbdrd_phy *phy_drd)
 {
@@ -1838,6 +2030,16 @@ static const struct exynos5_usbdrd_phy_config phy_cfg_exynos2200[] = {
 	},
 };
 
+static const struct exynos5_usbdrd_phy_config phy_cfg_zuma_handoff[] = {
+	{
+		.id		= EXYNOS5_DRDPHY_UTMI,
+		.phy_isol	= exynos5_usbdrd_phy_isol,
+	}, {
+		.id		= EXYNOS5_DRDPHY_PIPE3,
+		.phy_isol	= exynos5_usbdrd_phy_isol,
+	},
+};
+
 static int exynos5_usbdrd_orien_sw_set(struct typec_switch_dev *sw,
 				       enum typec_orientation orientation)
 {
@@ -1989,6 +2191,19 @@ static const char * const exynos5433_core_clk_names[] = {
 
 static const char * const exynos5_regulator_names[] = {
 	"vbus", "vbus-boost",
+};
+
+static const struct exynos5_usbdrd_phy_drvdata zuma_handoff_usbdrd_phy = {
+	.phy_cfg		= phy_cfg_zuma_handoff,
+	.phy_ops		= &zuma_usbdrd_phy_ops,
+	.pmu_offset_usbdrd0_phy	= EXYNOS2200_PHY_CTRL_USB20,
+	.clk_names		= NULL,
+	.n_clks			= 0,
+	.core_clk_names		= NULL,
+	.n_core_clks		= 0,
+	.regulator_names	= NULL,
+	.n_regulators		= 0,
+	.zuma_handoff		= true,
 };
 
 static const struct exynos5_usbdrd_phy_drvdata exynos2200_usb32drd_phy = {
@@ -2877,6 +3092,9 @@ static const struct exynos5_usbdrd_phy_drvdata gs101_usbd31rd_phy = {
 
 static const struct of_device_id exynos5_usbdrd_phy_of_match[] = {
 	{
+		.compatible = "samsung,exynos-usbdrd-phy",
+		.data = &zuma_handoff_usbdrd_phy,
+	}, {
 		.compatible = "google,gs101-usb31drd-phy",
 		.data = &gs101_usbd31rd_phy
 	}, {
@@ -2941,6 +3159,10 @@ static int exynos5_usbdrd_phy_probe(struct platform_device *pdev)
 		return -EINVAL;
 	phy_drd->drv_data = drv_data;
 
+	if (drv_data->zuma_handoff &&
+	    !of_property_read_bool(node, "google,bootloader-usb-handoff"))
+		return -ENODEV;
+
 	ret = devm_mutex_init(dev, &phy_drd->phy_mutex);
 	if (ret)
 		return ret;
@@ -2963,10 +3185,15 @@ static int exynos5_usbdrd_phy_probe(struct platform_device *pdev)
 			return PTR_ERR(reg);
 		phy_drd->reg_pma = reg;
 	} else {
-		/* DTB with just a single region */
 		phy_drd->reg_phy = devm_platform_ioremap_resource(pdev, 0);
 		if (IS_ERR(phy_drd->reg_phy))
 			return PTR_ERR(phy_drd->reg_phy);
+	}
+
+	if (drv_data->zuma_handoff) {
+		phy_drd->reg_eusb = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(phy_drd->reg_eusb))
+			return PTR_ERR(phy_drd->reg_eusb);
 	}
 
 	/*
