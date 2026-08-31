@@ -13,21 +13,12 @@ description: |
   ARM platforms using SoCs designed by Google branded "Tensor" used in Pixel
   devices.
 
-  Currently upstream this is devices using "gs101" SoC which is found in Pixel
-  6, Pixel 6 Pro and Pixel 6a.
+  Upstream supports the "gs101" SoC found in Pixel 6 devices and the "zuma"
+  SoC found in Pixel 8 devices.
 
-  Google have a few different names for the SoC:
-  - Marketing name ("Tensor")
-  - Codename ("Whitechapel")
-  - SoC ID ("gs101")
-  - Die ID ("S5P9845")
-
-  Likewise there are a couple of names for the actual device
-  - Marketing name ("Pixel 6")
-  - Codename ("Oriole")
-
-  Devicetrees should use the lowercased SoC ID and lowercased board codename,
-  e.g. gs101 and gs101-oriole.
+  Google uses several names for its SoCs, including a marketing name, codename,
+  SoC ID and die ID. Devicetrees use the lowercased public SoC identifier and
+  lowercased board codename, for example gs101-oriole and zuma-husky.
 
 properties:
   $nodename:
@@ -40,6 +31,10 @@ properties:
               - google,gs101-oriole
               - google,gs101-raven
           - const: google,gs101
+      - description: Google Pixel 8 Pro (Husky)
+        items:
+          - const: google,zuma-husky
+          - const: google,zuma
 
   # Bootloader requires empty ect node to be present
   ect:
