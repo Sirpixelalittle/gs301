@@ -8,7 +8,6 @@
  * Author: Vivek Gautam <gautam.vivek@samsung.com>
  */
 
-#include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -79,9 +78,6 @@
 #define ZUMA_EUSB_TEST_IDDQ			BIT(6)
 
 #define ZUMA_HSI0_STATUS			0x2a84
-#define ZUMA_PMU_BASE				0x15460000
-#define ZUMA_SMC_PRIV_REG			0x82000504
-#define ZUMA_PRIV_REG_RMW			2
 
 /* Exynos5: USB 3.0 DRD PHY registers */
 #define EXYNOS5_DRD_LINKSYSTEM			0x04
@@ -1629,20 +1625,24 @@ static void zuma_usbdrd_eusb_init(struct exynos5_usbdrd_phy *phy_drd)
 			       ZUMA_EUSB_UTMI_PORT_RESET_OVERRIDE, 0);
 }
 
-static int zuma_usbdrd_pmu_enable_usb2(struct exynos5_usbdrd_phy *phy_drd,
-				       struct phy_usb_instance *inst)
+static int zuma_usbdrd_check_pmu_handoff(struct exynos5_usbdrd_phy *phy_drd)
 {
-	struct arm_smccc_res res;
+	u32 pmu_mask;
+	int ret;
 
-	arm_smccc_smc(ZUMA_SMC_PRIV_REG,
-		      ZUMA_PMU_BASE + inst->pmu_offset,
-		      ZUMA_PRIV_REG_RMW, BIT(0), BIT(0), 0, 0, 0, &res);
-	if ((long)res.a0) {
-		dev_err(phy_drd->dev, "secure USB2 PMU enable failed: %ld\n",
-			(long)res.a0);
-		return (int)res.a0;
-	}
+	ret = of_property_read_u32(phy_drd->dev->of_node, "pmu_mask",
+				   &pmu_mask);
+	if (ret)
+		return dev_err_probe(phy_drd->dev, ret,
+				     "shipping pmu_mask is missing\n");
 
+	if (pmu_mask)
+		return dev_err_probe(phy_drd->dev, -EINVAL,
+				     "refusing unexpected pmu_mask %#x\n",
+				     pmu_mask);
+
+	dev_info(phy_drd->dev,
+		 "shipping PMU mask is zero; retaining bootloader state\n");
 	return 0;
 }
 
@@ -1666,7 +1666,7 @@ static int zuma_usbdrd_phy_init(struct phy *phy)
 		return -ENODEV;
 	}
 
-	ret = zuma_usbdrd_pmu_enable_usb2(phy_drd, inst);
+	ret = zuma_usbdrd_check_pmu_handoff(phy_drd);
 	if (ret)
 		return ret;
 
