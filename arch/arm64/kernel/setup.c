@@ -33,6 +33,7 @@
 #include <linux/sched/task.h>
 #include <linux/scs.h>
 #include <linux/mm.h>
+#include <linux/soc/samsung/zuma-display-handoff.h>
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
@@ -168,10 +169,13 @@ static void __init smp_build_mpidr_hash(void)
 		pr_warn("Large number of MPIDR hash buckets detected\n");
 }
 
-#define HUSKY_BOOT_FB_BASE	((phys_addr_t)0xfac00000)
-#define HUSKY_BOOT_FB_SIZE	((phys_addr_t)0x00f57000)
+#define HUSKY_BOOT_FB_BASE		((phys_addr_t)0xfac00000)
+#define HUSKY_BOOT_FB_SIZE		((phys_addr_t)0x00f57000)
+#define HUSKY_FLIP_FB_ALLOC_SIZE	((phys_addr_t)0x01000000)
+#define HUSKY_FLIP_FB_ALIGNMENT		((phys_addr_t)0x00100000)
 
 bool zuma_husky_boot_framebuffer_reserved __initdata;
+phys_addr_t zuma_husky_flip_framebuffer_base __initdata;
 
 static void __init reserve_husky_boot_framebuffer(void)
 {
@@ -211,6 +215,27 @@ static void __init reserve_husky_boot_framebuffer(void)
 	zuma_husky_boot_framebuffer_reserved = true;
 	pr_info("Reserved Husky boot framebuffer: %pa-%pa\n",
 		&base, &end);
+}
+
+static void __init reserve_husky_flip_framebuffer(void)
+{
+	phys_addr_t base, end;
+
+	if (!zuma_husky_boot_framebuffer_reserved)
+		return;
+
+	zuma_husky_flip_framebuffer_base =
+		memblock_phys_alloc_range(HUSKY_FLIP_FB_ALLOC_SIZE,
+					  HUSKY_FLIP_FB_ALIGNMENT, 0,
+					  HUSKY_BOOT_FB_BASE);
+	if (!zuma_husky_flip_framebuffer_base) {
+		pr_crit("Failed to reserve Husky flip framebuffer\n");
+		return;
+	}
+
+	base = zuma_husky_flip_framebuffer_base;
+	end = base + HUSKY_FLIP_FB_ALLOC_SIZE - 1;
+	pr_info("Reserved Husky flip framebuffer: %pa-%pa\n", &base, &end);
 }
 
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
@@ -378,6 +403,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	}
 
 	arm64_memblock_init();
+	reserve_husky_flip_framebuffer();
 
 	paging_init();
 

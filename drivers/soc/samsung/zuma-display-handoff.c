@@ -27,6 +27,7 @@
 #include <linux/printk.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/soc/samsung/zuma-display-handoff.h>
 #include <linux/workqueue.h>
 
 #include <asm/cache.h>
@@ -72,6 +73,18 @@
 
 #define ZUMA_DPP0_BASE                  0x19900000
 #define ZUMA_DPP0_MIN_SIZE              0x100
+
+#define ZUMA_SYSMMU_DPUF0_BASE          0x19840000
+#define ZUMA_SYSMMU_DPUF0_MIN_SIZE      0x9000
+#define ZUMA_SYSMMU_MMU_CTRL            0x0000
+#define ZUMA_SYSMMU_MMU_STATUS          0x0008
+#define ZUMA_SYSMMU_MMU_VERSION         0x0034
+#define ZUMA_SYSMMU_PMMU_INDICATOR      0x2ffc
+#define ZUMA_SYSMMU_PMMU_INFO           0x3000
+#define ZUMA_SYSMMU_SWALKER_INFO        0x3004
+#define ZUMA_SYSMMU_VM_CTRL             0x8000
+#define ZUMA_SYSMMU_VM_FLPT_BASE        0x8404
+#define ZUMA_SYSMMU_VM_ATTRIBUTE        0x8408
 #define ZUMA_DPP_RDMA_ENABLE            0x0000
 #define ZUMA_DPP_RDMA_IN_CTRL_0         0x0008
 #define ZUMA_DPP_RDMA_SRC_WIDTH         0x0010
@@ -95,10 +108,9 @@
 	(ZUMA_HANDOFF_FB_PIXELS * sizeof(u32))
 #define ZUMA_HANDOFF_FB_STRIDE          \
 	(ZUMA_HANDOFF_FB_WIDTH * sizeof(u32))
+#define ZUMA_FLIP_FB_ALLOC_SIZE         0x01000000
 #define ZUMA_FB_FLUSH_DELAY_MS          16
 #define ZUMA_FB_PALETTE_SIZE            16
-
-extern bool zuma_husky_boot_framebuffer_reserved;
 
 struct zuma_display_block {
 	const char *name;
@@ -163,6 +175,13 @@ static struct zuma_display_block zuma_dpp0 = {
 	.min_size = ZUMA_DPP0_MIN_SIZE,
 };
 
+static struct zuma_display_block zuma_sysmmu_dpuf0 = {
+	.name = "DPUF0 SysMMU",
+	.compatible = "samsung,sysmmu-v9",
+	.phys = ZUMA_SYSMMU_DPUF0_BASE,
+	.min_size = ZUMA_SYSMMU_DPUF0_MIN_SIZE,
+};
+
 static struct zuma_display_block * const zuma_display_blocks[] = {
 	&zuma_dpub,
 	&zuma_dpuf0,
@@ -170,6 +189,7 @@ static struct zuma_display_block * const zuma_display_blocks[] = {
 	&zuma_dsim0,
 	&zuma_decon0,
 	&zuma_dpp0,
+	&zuma_sysmmu_dpuf0,
 };
 
 static const unsigned int zuma_snapshot_intervals_ms[] = {
@@ -290,6 +310,18 @@ static void zuma_display_snapshot(const char *label)
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IMG_SIZE),
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0),
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_SRC_STRIDE_0));
+
+	pr_info("zuma-display-handoff: %s DPUF0 SysMMU ctrl=%#x status=%#x version=%#x pmmu_sel=%#x pmmu=%#x swalker=%#x vm_ctrl=%#x flpt=%#x attr=%#x\n",
+		label,
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_MMU_CTRL),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_MMU_STATUS),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_MMU_VERSION),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_PMMU_INDICATOR),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_PMMU_INFO),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_SWALKER_INFO),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_VM_CTRL),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_VM_FLPT_BASE),
+		readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_VM_ATTRIBUTE));
 
 	pr_info("zuma-display-handoff: %s DSIM link0=%#x link1=%#x link3=%#x mipi=%#x dphy=%#x clock=%#x resolution=%#x config=%#x\n",
 		label,
@@ -786,6 +818,12 @@ static int __init zuma_display_handoff_init(void)
 	}
 
 	pr_info("zuma-display-handoff: guarded Zuma/Husky handoff active\n");
+	if (zuma_husky_flip_framebuffer_base)
+		pr_info("zuma-display-handoff: reserved flip framebuffer at %pa, size=%#x\n",
+			&zuma_husky_flip_framebuffer_base,
+			ZUMA_FLIP_FB_ALLOC_SIZE);
+	else
+		pr_warn("zuma-display-handoff: flip framebuffer reservation unavailable\n");
 	mutex_lock(&zuma_display_mmio_lock);
 	zuma_display_snapshot("early");
 	if (zuma_husky_boot_framebuffer_reserved)
