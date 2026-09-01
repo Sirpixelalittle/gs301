@@ -85,4 +85,13 @@ config EXYNOS_ZUMA_USB_HANDOFF
 	  and IOMMU providers are not available.  This is an awake, High-Speed
 	  gadget bring-up aid which relies on a powered fastboot handoff.
 
+config EXYNOS_ZUMA_WATCHDOG_HANDOFF
+	bool "Google Zuma watchdog bootloader handoff"
+	depends on ARCH_EXYNOS && OF
+	help
+	  Stop the powered Zuma cluster watchdog pair left running by the Google
+	  bootloader.  This is a guarded Husky bring-up aid for systems which use
+	  the shipping DT but do not yet have native Zuma clock and watchdog
+	  support.
+
 endif

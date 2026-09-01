@@ -15,3 +15,4 @@ obj-$(CONFIG_EXYNOS_REGULATOR_COUPLER) += exynos-regulator-coupler.o
 
 obj-$(CONFIG_SAMSUNG_PM_CHECK)	+= s3c-pm-check.o
 obj-$(CONFIG_EXYNOS_ZUMA_USB_HANDOFF) += zuma-usb-handoff.o
+obj-$(CONFIG_EXYNOS_ZUMA_WATCHDOG_HANDOFF) += zuma-watchdog-handoff.o
