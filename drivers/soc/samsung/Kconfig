@@ -94,4 +94,12 @@ config EXYNOS_ZUMA_WATCHDOG_HANDOFF
 	  the shipping DT but do not yet have native Zuma clock and watchdog
 	  support.
 
+config EXYNOS_ZUMA_DISPLAY_HANDOFF
+	bool "Google Zuma display bootloader handoff"
+	depends on ARCH_EXYNOS && ARM64 && OF
+	help
+	  Preserve and inspect the powered Zuma/Husky display pipeline left running
+	  by the Google bootloader.  This guarded handoff does not change display
+	  power, clocks, registers, panel state, or framebuffer pixels.
+
 endif

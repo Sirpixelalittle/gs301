@@ -23,6 +23,7 @@
 #include <linux/interrupt.h>
 #include <linux/smp.h>
 #include <linux/fs.h>
+#include <linux/string.h>
 #include <linux/panic_notifier.h>
 #include <linux/proc_fs.h>
 #include <linux/memblock.h>
@@ -167,6 +168,51 @@ static void __init smp_build_mpidr_hash(void)
 		pr_warn("Large number of MPIDR hash buckets detected\n");
 }
 
+#define HUSKY_BOOT_FB_BASE	((phys_addr_t)0xfac00000)
+#define HUSKY_BOOT_FB_SIZE	((phys_addr_t)0x00f57000)
+
+bool zuma_husky_boot_framebuffer_reserved __initdata;
+
+static void __init reserve_husky_boot_framebuffer(void)
+{
+	const char *model;
+	phys_addr_t base = HUSKY_BOOT_FB_BASE;
+	phys_addr_t end = HUSKY_BOOT_FB_BASE + HUSKY_BOOT_FB_SIZE - 1;
+	unsigned long root;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_EXYNOS_ZUMA_DISPLAY_HANDOFF))
+		return;
+
+	root = of_get_flat_dt_root();
+	model = of_flat_dt_get_machine_name();
+	if (!of_flat_dt_is_compatible(root, "google,zuma") ||
+	    !model || strcmp(model, "ZUMA HUSKY MP based on ZUMA"))
+		return;
+
+	if (!memblock_is_region_memory(HUSKY_BOOT_FB_BASE,
+				       HUSKY_BOOT_FB_SIZE)) {
+		pr_crit("Husky boot framebuffer is not wholly RAM; not reserving\n");
+		return;
+	}
+
+	if (memblock_is_region_reserved(HUSKY_BOOT_FB_BASE,
+					HUSKY_BOOT_FB_SIZE)) {
+		pr_crit("Husky boot framebuffer overlaps an early reservation; not reserving\n");
+		return;
+	}
+
+	ret = memblock_reserve(HUSKY_BOOT_FB_BASE, HUSKY_BOOT_FB_SIZE);
+	if (ret) {
+		pr_crit("Failed to reserve Husky boot framebuffer: %d\n", ret);
+		return;
+	}
+
+	zuma_husky_boot_framebuffer_reserved = true;
+	pr_info("Reserved Husky boot framebuffer: %pa-%pa\n",
+		&base, &end);
+}
+
 static void __init setup_machine_fdt(phys_addr_t dt_phys)
 {
 	int size = 0;
@@ -195,6 +241,8 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 		while (true)
 			cpu_relax();
 	}
+
+	reserve_husky_boot_framebuffer();
 
 	/* Early fixups are done, map the FDT as read-only now */
 	fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL_RO);
