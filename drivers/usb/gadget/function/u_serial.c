@@ -311,6 +311,7 @@ __acquires(&port->port_lock)
 {
 	struct list_head	*pool = &port->read_pool;
 	struct usb_ep		*out = port->port_usb->out;
+	unsigned int		started_before = port->read_started;
 
 	while (!list_empty(pool)) {
 		struct usb_request	*req;
@@ -337,8 +338,12 @@ __acquires(&port->port_lock)
 		spin_lock(&port->port_lock);
 
 		if (status) {
-			pr_debug("%s: %s %s err %d\n",
-					__func__, "queue", out->name, status);
+			if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+				pr_warn("ttyGS%d: RX queue %s failed: %d\n",
+					port->port_num, out->name, status);
+			else
+				pr_debug("%s: %s %s err %d\n",
+					 __func__, "queue", out->name, status);
 			list_add(&req->list, pool);
 			break;
 		}
@@ -348,6 +353,13 @@ __acquires(&port->port_lock)
 		if (!port->port_usb)
 			break;
 	}
+
+	if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF) &&
+	    port->read_started != started_before)
+		pr_info("ttyGS%d: RX active %u -> %u on %s (maxpacket %u)\n",
+			port->port_num, started_before, port->read_started,
+			out->name, out->maxpacket);
+
 	return port->read_started;
 }
 
@@ -415,6 +427,9 @@ static void gs_rx_push(struct work_struct *work)
 			port->icount.rx += size;
 			count = tty_insert_flip_string(&port->port, packet,
 					size);
+			if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+				pr_info("ttyGS%d: RX pushed %d/%u bytes to tty\n",
+					port->port_num, count, size);
 			if (count)
 				do_push = true;
 			if (count != size) {
@@ -458,6 +473,11 @@ static void gs_rx_push(struct work_struct *work)
 static void gs_read_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct gs_port	*port = ep->driver_data;
+
+	if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+		pr_info("ttyGS%d: RX complete on %s: status %d actual %u/%u\n",
+			port->port_num, ep->name, req->status,
+			req->actual, req->length);
 
 	/* Queue all received data until the tty layer is ready for it. */
 	spin_lock(&port->port_lock);
