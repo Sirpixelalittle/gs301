@@ -266,7 +266,13 @@ __acquires(&port->port_lock)
 		list_del(&req->list);
 		req->zero = kfifo_is_empty(&port->port_write_buf);
 
-		pr_vdebug("ttyGS%d: tx len=%d, %3ph ...\n", port->port_num, len, req->buf);
+		if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+			pr_info("ttyGS%d: TX queue on %s: len %d zero %u active %d\n",
+				port->port_num, in->name, len, req->zero,
+				port->write_started);
+		else
+			pr_vdebug("ttyGS%d: tx len=%d, %3ph ...\n",
+				  port->port_num, len, req->buf);
 
 		/* Drop lock while we call out of driver; completions
 		 * could be issued while we do so.  Disconnection may
@@ -282,13 +288,20 @@ __acquires(&port->port_lock)
 		port->write_busy = false;
 
 		if (status) {
-			pr_debug("%s: %s %s err %d\n",
-					__func__, "queue", in->name, status);
+			if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+				pr_warn("ttyGS%d: TX queue %s failed: %d\n",
+					port->port_num, in->name, status);
+			else
+				pr_debug("%s: %s %s err %d\n",
+					 __func__, "queue", in->name, status);
 			list_add(&req->list, pool);
 			break;
 		}
 
 		port->write_started++;
+		if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+			pr_info("ttyGS%d: TX active now %d on %s\n",
+				port->port_num, port->write_started, in->name);
 
 		/* abort immediately after disconnect */
 		if (!port->port_usb)
@@ -494,6 +507,11 @@ static void gs_read_complete(struct usb_ep *ep, struct usb_request *req)
 static void gs_write_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct gs_port	*port = ep->driver_data;
+
+	if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+		pr_info("ttyGS%d: TX complete on %s: status %d actual %u/%u\n",
+			port->port_num, ep->name, req->status,
+			req->actual, req->length);
 
 	spin_lock(&port->port_lock);
 	list_add(&req->list, &port->write_pool);
