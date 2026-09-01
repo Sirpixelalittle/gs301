@@ -474,10 +474,15 @@ static void gs_read_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct gs_port	*port = ep->driver_data;
 
-	if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF))
+	if (IS_ENABLED(CONFIG_EXYNOS_ZUMA_USB_HANDOFF)) {
 		pr_info("ttyGS%d: RX complete on %s: status %d actual %u/%u\n",
 			port->port_num, ep->name, req->status,
 			req->actual, req->length);
+		if (req->actual)
+			print_hex_dump(KERN_INFO, "ttyGS RX data: ",
+				       DUMP_PREFIX_NONE, 16, 1, req->buf,
+				       min_t(unsigned int, req->actual, 32), false);
+	}
 
 	/* Queue all received data until the tty layer is ready for it. */
 	spin_lock(&port->port_lock);
