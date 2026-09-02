@@ -113,11 +113,18 @@
 #define ZUMA_DPP_RDMA_BUSY              BIT(2)
 #define ZUMA_DPP_FORMAT_SHIFT           8
 #define ZUMA_DPP_FORMAT_MASK            0x3f
+#define ZUMA_DPP_FORMAT_FIELD_MASK      \
+	(ZUMA_DPP_FORMAT_MASK << ZUMA_DPP_FORMAT_SHIFT)
+#define ZUMA_DPP_FORMAT_BGRA8888        0
+#define ZUMA_DPP_FORMAT_BGRX8888        4
 
 #define ZUMA_HANDOFF_FB_BASE            0xfac00000
 #define ZUMA_HANDOFF_FB_WIDTH           1344
 #define ZUMA_HANDOFF_FB_HEIGHT          2992
 #define ZUMA_HANDOFF_FB_CTRL            0xff400000
+#define ZUMA_HANDOFF_FB_BGRX_CTRL       \
+	((ZUMA_HANDOFF_FB_CTRL & ~ZUMA_DPP_FORMAT_FIELD_MASK) | \
+	 (ZUMA_DPP_FORMAT_BGRX8888 << ZUMA_DPP_FORMAT_SHIFT))
 #define ZUMA_HANDOFF_FB_PIXELS          \
 	(ZUMA_HANDOFF_FB_WIDTH * ZUMA_HANDOFF_FB_HEIGHT)
 #define ZUMA_HANDOFF_FB_SIZE            \
@@ -126,6 +133,7 @@
 	(ZUMA_HANDOFF_FB_WIDTH * sizeof(u32))
 #define ZUMA_FLIP_FB_ALLOC_SIZE         0x01000000
 #define ZUMA_FLIP_FB_ALIGNMENT          0x00100000
+#define ZUMA_FORMAT_SWITCH_DELAY_MS     2000
 #define ZUMA_FB_FLUSH_DELAY_MS          16
 #define ZUMA_FB_PALETTE_SIZE            16
 
@@ -151,6 +159,7 @@ struct zuma_framebuffer {
 static DEFINE_MUTEX(zuma_display_mmio_lock);
 static bool zuma_framebuffer_validated;
 static phys_addr_t zuma_framebuffer_phys = ZUMA_HANDOFF_FB_BASE;
+static u32 zuma_framebuffer_ctrl = ZUMA_HANDOFF_FB_CTRL;
 
 static struct zuma_display_block zuma_dpub = {
 	.name = "DPUB power domain",
@@ -235,6 +244,10 @@ static const char * const zuma_snapshot_labels[] = {
 };
 
 static unsigned int zuma_snapshot_index;
+static int zuma_framebuffer_register(void);
+static void zuma_display_format_workfn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(zuma_display_format_work,
+				 zuma_display_format_workfn);
 static void zuma_display_snapshot_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(zuma_display_snapshot_work,
 				 zuma_display_snapshot_workfn);
@@ -347,7 +360,7 @@ static bool zuma_display_sysmmu_bypassed(void)
 static void zuma_display_snapshot(const char *label)
 {
 	u32 dpub, dpuf0, dpuf1;
-	u32 rdma_ctrl;
+	u32 rdma_ctrl, rdma_shadow_ctrl;
 
 	if (!zuma_display_domains_on(&dpub, &dpuf0, &dpuf1)) {
 		pr_info("zuma-display-handoff: %s domains DPUB=%#x DPUF0=%#x DPUF1=%#x; display reads skipped\n",
@@ -371,10 +384,12 @@ static void zuma_display_snapshot(const char *label)
 		readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ));
 
 	rdma_ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0);
-	pr_info("zuma-display-handoff: %s DPP0 enable=%#x ctrl=%#x format=%u src=%#xx%#x offset=%#x image=%#x base=%#x shadow=%#x stride=%#x\n",
+	rdma_shadow_ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0 +
+				 ZUMA_DPP_RDMA_SHADOW_OFFSET);
+	pr_info("zuma-display-handoff: %s DPP0 enable=%#x ctrl=%#x shadow-ctrl=%#x format=%u src=%#xx%#x offset=%#x image=%#x base=%#x shadow=%#x stride=%#x\n",
 		label,
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE),
-		rdma_ctrl,
+		rdma_ctrl, rdma_shadow_ctrl,
 		(rdma_ctrl >> ZUMA_DPP_FORMAT_SHIFT) & ZUMA_DPP_FORMAT_MASK,
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_SRC_WIDTH),
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_SRC_HEIGHT),
@@ -602,7 +617,7 @@ static int zuma_display_trigger_frame(u32 *frame_before, u32 *frame_after)
 	return 0;
 }
 
-static bool zuma_display_update_ready(void)
+static bool zuma_display_update_ready_for_ctrl(u32 ctrl, u32 shadow_ctrl)
 {
 	u32 dpub, dpuf0, dpuf1;
 
@@ -618,6 +633,9 @@ static bool zuma_display_update_ready(void)
 			ZUMA_DECON_INT_EXPECTED &&
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) ==
 			ZUMA_DPP_RDMA_EXPECTED &&
+	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0) == ctrl &&
+	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0 +
+		     ZUMA_DPP_RDMA_SHADOW_OFFSET) == shadow_ctrl &&
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0) ==
 			lower_32_bits(zuma_framebuffer_phys) &&
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0 +
@@ -627,6 +645,12 @@ static bool zuma_display_update_ready(void)
 	       zuma_display_sysmmu_bypassed() &&
 	       !readl(zuma_dsim0.base + ZUMA_DSIM_LINK_STATUS1) &&
 	       !readl(zuma_dsim0.base + ZUMA_DSIM_MIPI_STATUS);
+}
+
+static bool zuma_display_update_ready(void)
+{
+	return zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
+						  zuma_framebuffer_ctrl);
 }
 
 static bool __init zuma_flip_buffer_valid(void)
@@ -700,6 +724,107 @@ static int __init zuma_display_commit_base(phys_addr_t base,
 	return 0;
 }
 
+static int zuma_display_write_ctrl(u32 ctrl)
+{
+	writel(ctrl, zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0);
+	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0) != ctrl)
+		return -EIO;
+
+	return 0;
+}
+
+static int zuma_display_commit_format(u32 format, u32 *ctrl_after,
+				      u32 *frame_before,
+				      u32 *frame_after)
+{
+	u32 ctrl;
+	int ret;
+
+	if (format & ~ZUMA_DPP_FORMAT_MASK)
+		return -EINVAL;
+
+	ret = zuma_display_wait_idle();
+	if (ret)
+		return ret;
+
+	ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0);
+	ctrl &= ~ZUMA_DPP_FORMAT_FIELD_MASK;
+	ctrl |= format << ZUMA_DPP_FORMAT_SHIFT;
+	ret = zuma_display_write_ctrl(ctrl);
+	if (ret)
+		return ret;
+
+	ret = zuma_display_request_active_window();
+	if (ret)
+		return ret;
+
+	ret = zuma_display_trigger_frame(frame_before, frame_after);
+	if (ret)
+		return ret;
+
+	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0) != ctrl ||
+	    readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0 +
+		  ZUMA_DPP_RDMA_SHADOW_OFFSET) != ctrl)
+		return -EIO;
+
+	*ctrl_after = ctrl;
+	return 0;
+}
+
+static int zuma_display_rollback_format(u32 *ctrl_after,
+					u32 *frame_before,
+					u32 *frame_after)
+{
+	u32 ctrl, shadow_ctrl;
+	int ret;
+
+	ret = zuma_display_wait_idle();
+	if (ret)
+		return ret;
+
+	ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0);
+	shadow_ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0 +
+			    ZUMA_DPP_RDMA_SHADOW_OFFSET);
+	if ((ctrl != ZUMA_HANDOFF_FB_CTRL &&
+	     ctrl != ZUMA_HANDOFF_FB_BGRX_CTRL) ||
+	    (shadow_ctrl != ZUMA_HANDOFF_FB_CTRL &&
+	     shadow_ctrl != ZUMA_HANDOFF_FB_BGRX_CTRL)) {
+		pr_err("zuma-display-handoff: refusing format rollback from unknown ctrl=%#x shadow=%#x\n",
+		       ctrl, shadow_ctrl);
+		return -EIO;
+	}
+
+	if (!zuma_display_update_ready_for_ctrl(ctrl, shadow_ctrl)) {
+		pr_err("zuma-display-handoff: refusing format rollback from unsafe ctrl=%#x shadow=%#x\n",
+		       ctrl, shadow_ctrl);
+		return -EIO;
+	}
+
+	*frame_before = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	*frame_after = *frame_before;
+	if (ctrl == ZUMA_HANDOFF_FB_CTRL &&
+	    shadow_ctrl == ZUMA_HANDOFF_FB_CTRL) {
+		*ctrl_after = ctrl;
+		return 0;
+	}
+
+	if (ctrl == ZUMA_HANDOFF_FB_BGRX_CTRL &&
+	    shadow_ctrl == ZUMA_HANDOFF_FB_CTRL) {
+		ret = zuma_display_write_ctrl(ZUMA_HANDOFF_FB_CTRL);
+		if (ret)
+			return ret;
+		if (!zuma_display_update_ready_for_ctrl(ZUMA_HANDOFF_FB_CTRL,
+							ZUMA_HANDOFF_FB_CTRL))
+			return -EIO;
+		*ctrl_after = ZUMA_HANDOFF_FB_CTRL;
+		return 0;
+	}
+
+	return zuma_display_commit_format(ZUMA_DPP_FORMAT_BGRA8888,
+					  ctrl_after, frame_before,
+					  frame_after);
+}
+
 static bool __init zuma_display_flip_to_reserved(void)
 {
 	phys_addr_t new_base = zuma_husky_flip_framebuffer_base;
@@ -769,6 +894,51 @@ static bool __init zuma_display_flip_to_reserved(void)
 
 	pr_info("zuma-display-handoff: DPP0 base rollback completed frame=%#x->%#x\n",
 		rollback_before, rollback_after);
+	return false;
+}
+
+static bool zuma_display_switch_to_bgrx(void)
+{
+	u32 ctrl_after = 0, rollback_ctrl = 0;
+	u32 frame_before = 0, frame_after = 0;
+	u32 rollback_before = 0, rollback_after = 0;
+	int rollback_ret;
+	int ret;
+
+	if (zuma_framebuffer_ctrl != ZUMA_HANDOFF_FB_CTRL ||
+	    !zuma_display_update_ready()) {
+		pr_err("zuma-display-handoff: BGRX format switch refused by BGRA state\n");
+		return false;
+	}
+
+	ret = zuma_display_commit_format(ZUMA_DPP_FORMAT_BGRX8888,
+					 &ctrl_after, &frame_before,
+					 &frame_after);
+	if (!ret && ctrl_after == ZUMA_HANDOFF_FB_BGRX_CTRL) {
+		zuma_framebuffer_ctrl = ctrl_after;
+		if (zuma_display_update_ready()) {
+			pr_info("zuma-display-handoff: DPP0 format BGRA8888(0)->BGRX8888(4) ctrl=%#x frame=%#x->%#x\n",
+				ctrl_after, frame_before, frame_after);
+			return true;
+		}
+		ret = -EIO;
+	}
+
+	pr_err("zuma-display-handoff: DPP0 BGRX format switch failed: %d; attempting rollback\n",
+	       ret ?: -EIO);
+	rollback_ret = zuma_display_rollback_format(&rollback_ctrl,
+						    &rollback_before,
+						    &rollback_after);
+	zuma_framebuffer_ctrl = ZUMA_HANDOFF_FB_CTRL;
+	if (rollback_ret || rollback_ctrl != ZUMA_HANDOFF_FB_CTRL ||
+	    !zuma_display_update_ready()) {
+		pr_crit("zuma-display-handoff: DPP0 BGRA format rollback failed: %d\n",
+			rollback_ret ?: -EIO);
+		return false;
+	}
+
+	pr_info("zuma-display-handoff: DPP0 BGRA format rollback completed ctrl=%#x frame=%#x->%#x\n",
+		rollback_ctrl, rollback_before, rollback_after);
 	return false;
 }
 
@@ -968,8 +1138,9 @@ static int zuma_fb_setcolreg(unsigned int regno, unsigned int red,
 
 	value = ((red >> 8) << info->var.red.offset) |
 		((green >> 8) << info->var.green.offset) |
-		((blue >> 8) << info->var.blue.offset) |
-		(0xffU << info->var.transp.offset);
+		((blue >> 8) << info->var.blue.offset);
+	if (info->var.transp.length)
+		value |= 0xffU << info->var.transp.offset;
 	palette[regno] = value;
 	return 0;
 }
@@ -1016,6 +1187,20 @@ static const struct fb_ops zuma_fb_ops = {
 static struct fb_deferred_io zuma_fb_defio = {
 	.deferred_io = zuma_fb_deferred_io,
 };
+
+static void zuma_display_format_workfn(struct work_struct *work)
+{
+	bool register_fb;
+
+	mutex_lock(&zuma_display_mmio_lock);
+	if (zuma_framebuffer_validated)
+		zuma_framebuffer_validated = zuma_display_switch_to_bgrx();
+	register_fb = zuma_framebuffer_validated;
+	mutex_unlock(&zuma_display_mmio_lock);
+
+	if (register_fb)
+		zuma_framebuffer_register();
+}
 
 static void zuma_display_snapshot_workfn(struct work_struct *work)
 {
@@ -1085,6 +1270,9 @@ static int __init zuma_display_handoff_init(void)
 		pr_crit("zuma-display-handoff: framebuffer reservation unavailable; scan skipped\n");
 	}
 	mutex_unlock(&zuma_display_mmio_lock);
+	if (zuma_framebuffer_validated)
+		schedule_delayed_work(&zuma_display_format_work,
+				      msecs_to_jiffies(ZUMA_FORMAT_SWITCH_DELAY_MS));
 	schedule_delayed_work(&zuma_display_snapshot_work,
 			      msecs_to_jiffies(zuma_snapshot_intervals_ms[0]));
 	return 0;
@@ -1095,15 +1283,14 @@ out_unmap:
 }
 early_initcall(zuma_display_handoff_init);
 
-static int __init zuma_framebuffer_init(void)
+static int zuma_framebuffer_register(void)
 {
 	struct zuma_framebuffer *par;
 	struct fb_info *info;
 	void *screen_buffer;
 	int ret;
 
-	if (!zuma_husky_boot_framebuffer_reserved ||
-	    !zuma_framebuffer_validated)
+	if (!zuma_framebuffer_validated)
 		return 0;
 
 	mutex_lock(&zuma_display_mmio_lock);
@@ -1152,7 +1339,7 @@ static int __init zuma_framebuffer_init(void)
 	info->var.blue.offset = 0;
 	info->var.blue.length = 8;
 	info->var.transp.offset = 24;
-	info->var.transp.length = 8;
+	info->var.transp.length = 0;
 	info->var.height = -1;
 	info->var.width = -1;
 	info->var.activate = FB_ACTIVATE_NOW;
@@ -1177,7 +1364,7 @@ static int __init zuma_framebuffer_init(void)
 	if (ret)
 		goto out_defio;
 
-	pr_info("zuma-display-handoff: fb%d registered at %pa, %ux%u BGRA8888, stride=%zu\n",
+	pr_info("zuma-display-handoff: fb%d registered at %pa, %ux%u BGRX8888, stride=%zu\n",
 		info->node, &zuma_framebuffer_phys, ZUMA_HANDOFF_FB_WIDTH,
 		ZUMA_HANDOFF_FB_HEIGHT, (size_t)ZUMA_HANDOFF_FB_STRIDE);
 	return 0;
@@ -1190,4 +1377,3 @@ out_release:
 	pr_err("zuma-display-handoff: framebuffer registration failed: %d\n", ret);
 	return 0;
 }
-late_initcall(zuma_framebuffer_init);
