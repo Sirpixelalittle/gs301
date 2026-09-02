@@ -96,16 +96,13 @@ config EXYNOS_ZUMA_WATCHDOG_HANDOFF
 
 config EXYNOS_ZUMA_DISPLAY_HANDOFF
 	bool "Google Zuma display bootloader handoff"
-	depends on ARCH_EXYNOS && ARM64 && OF && FB && FB_DEVICE
-	select FB_DEFERRED_IO
-	select FB_SYS_FILLRECT
-	select FB_SYS_COPYAREA
-	select FB_SYS_IMAGEBLIT
+	depends on ARCH_EXYNOS && ARM64 && OF && DRM=y
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_KMS_HELPER
 	help
 	  Preserve the powered Zuma/Husky display pipeline left running by the
-	  Google bootloader and expose its reserved linear buffer through fbdev.
-	  Updates retain the inherited display configuration and use its existing
-	  command-mode hardware trigger.  Native power, clock, panel and DRM/KMS
-	  support are still required to replace this temporary handoff.
+	  Google bootloader and expose its reserved linear buffer only through
+	  fixed-mode DRM/KMS shmem shadow updates.  Native power, clock, panel and
+	  link initialization are still required to replace this handoff.
 
 endif

@@ -3,20 +3,21 @@
  * Display bootloader handoff for Google Zuma/Husky.
  *
  * The shipping boot chain leaves a working HK3 command-mode display pipeline.
- * Until native Zuma DRM/KMS support exists, preserve that state and expose its
- * reserved linear buffer through fbdev.  Initial adoption may copy and switch
- * only the DPP base; later framebuffer updates only admit a hardware trigger.
+ * Until native Zuma initialization exists, preserve that state behind fixed-
+ * mode DRM/KMS. Initial adoption may copy and switch only the DPP base. DRM
+ * updates copy from GEM shmem into that permanent buffer and admit only the
+ * proven frame trigger.
  */
 
 #include <linux/bitops.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-map-ops.h>
-#include <linux/fb.h>
-#include <linux/fs.h>
+#include <linux/device.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ioport.h>
+#include <linux/iosys-map.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -25,10 +26,25 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/printk.h>
-#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/soc/samsung/zuma-display-handoff.h>
 #include <linux/workqueue.h>
+
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_device.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_encoder.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_atomic_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_modes.h>
+#include <drm/drm_plane.h>
+#include <drm/drm_probe_helper.h>
 
 #include <asm/cache.h>
 
@@ -131,11 +147,18 @@
 	(ZUMA_HANDOFF_FB_PIXELS * sizeof(u32))
 #define ZUMA_HANDOFF_FB_STRIDE          \
 	(ZUMA_HANDOFF_FB_WIDTH * sizeof(u32))
-#define ZUMA_FLIP_FB_ALLOC_SIZE         0x01000000
-#define ZUMA_FLIP_FB_ALIGNMENT          0x00100000
+#define ZUMA_SCANOUT_FB_BASE            0xf9c00000
 #define ZUMA_FORMAT_SWITCH_DELAY_MS     2000
-#define ZUMA_FB_FLUSH_DELAY_MS          16
-#define ZUMA_FB_PALETTE_SIZE            16
+
+#define ZUMA_DRM_MODE_CLOCK_KHZ         270882
+#define ZUMA_DRM_MODE_HSYNC_START       1424
+#define ZUMA_DRM_MODE_HSYNC_END         1448
+#define ZUMA_DRM_MODE_HTOTAL            1490
+#define ZUMA_DRM_MODE_VSYNC_START       3004
+#define ZUMA_DRM_MODE_VSYNC_END         3008
+#define ZUMA_DRM_MODE_VTOTAL            3030
+#define ZUMA_DRM_MODE_WIDTH_MM          70
+#define ZUMA_DRM_MODE_HEIGHT_MM         155
 
 struct zuma_display_block {
 	const char *name;
@@ -146,20 +169,50 @@ struct zuma_display_block {
 	void __iomem *base;
 };
 
-struct zuma_framebuffer {
-	struct fb_info *info;
-	/* Protects dirty_start and dirty_end against fbdev and worker access. */
-	spinlock_t dirty_lock;
-	size_t dirty_start;
-	size_t dirty_end;
-	u32 palette[ZUMA_FB_PALETTE_SIZE];
-	u64 update_count;
+
+struct zuma_drm {
+	struct drm_device drm;
+	struct drm_connector connector;
+	struct drm_plane primary_plane;
+	struct drm_crtc crtc;
+	struct drm_encoder encoder;
 };
 
 static DEFINE_MUTEX(zuma_display_mmio_lock);
+static DEFINE_MUTEX(zuma_drm_registration_lock);
 static bool zuma_framebuffer_validated;
-static phys_addr_t zuma_framebuffer_phys = ZUMA_HANDOFF_FB_BASE;
+static bool zuma_drm_scanout_ready;
+static bool zuma_drm_initcalls_complete;
+static bool zuma_drm_update_failed;
+static phys_addr_t zuma_framebuffer_phys __ro_after_init =
+	ZUMA_HANDOFF_FB_BASE;
 static u32 zuma_framebuffer_ctrl = ZUMA_HANDOFF_FB_CTRL;
+static u64 zuma_drm_update_count;
+static const u32 *zuma_boot_buffer __ro_after_init;
+static void *zuma_scanout_buffer __ro_after_init;
+static struct device *zuma_drm_root;
+static struct zuma_drm *zuma_drm_device;
+
+/*
+ * Adopt the boot chain's fixed HK3 mode.  Its existing command-mode stream
+ * uses DSC 1.1 with two 672x187 slices; this handoff driver does not rewrite
+ * the panel, DSIM or DSC state.
+ */
+static const struct drm_display_mode zuma_drm_fixed_mode = {
+	.clock = ZUMA_DRM_MODE_CLOCK_KHZ,
+	.hdisplay = ZUMA_HANDOFF_FB_WIDTH,
+	.hsync_start = ZUMA_DRM_MODE_HSYNC_START,
+	.hsync_end = ZUMA_DRM_MODE_HSYNC_END,
+	.htotal = ZUMA_DRM_MODE_HTOTAL,
+	.vdisplay = ZUMA_HANDOFF_FB_HEIGHT,
+	.vsync_start = ZUMA_DRM_MODE_VSYNC_START,
+	.vsync_end = ZUMA_DRM_MODE_VSYNC_END,
+	.vtotal = ZUMA_DRM_MODE_VTOTAL,
+	.width_mm = ZUMA_DRM_MODE_WIDTH_MM,
+	.height_mm = ZUMA_DRM_MODE_HEIGHT_MM,
+	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+	.name = "1344x2992",
+};
 
 static struct zuma_display_block zuma_dpub = {
 	.name = "DPUB power domain",
@@ -244,13 +297,345 @@ static const char * const zuma_snapshot_labels[] = {
 };
 
 static unsigned int zuma_snapshot_index;
-static int zuma_framebuffer_register(void);
 static void zuma_display_format_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(zuma_display_format_work,
 				 zuma_display_format_workfn);
 static void zuma_display_snapshot_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(zuma_display_snapshot_work,
 				 zuma_display_snapshot_workfn);
+
+static const u32 zuma_drm_primary_plane_formats[] = {
+	DRM_FORMAT_XRGB8888,
+};
+
+static enum drm_connector_status
+zuma_drm_connector_detect(struct drm_connector *connector, bool force)
+{
+	return connector_status_connected;
+}
+
+static int zuma_drm_connector_get_modes(struct drm_connector *connector)
+{
+	return drm_connector_helper_get_modes_fixed(connector,
+						    &zuma_drm_fixed_mode);
+}
+
+static int zuma_drm_primary_plane_atomic_check(struct drm_plane *plane,
+					       struct drm_atomic_commit *state)
+{
+	struct zuma_drm *zdev = container_of(plane, struct zuma_drm,
+					      primary_plane);
+	struct drm_plane_state *old_plane_state;
+	struct drm_plane_state *new_plane_state;
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_framebuffer *fb;
+	int ret;
+
+	if (state->async_update)
+		return -EOPNOTSUPP;
+
+	old_plane_state = drm_atomic_get_old_plane_state(state, plane);
+	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
+	if (!!new_plane_state->crtc != !!new_plane_state->fb)
+		return -EINVAL;
+
+	if (!new_plane_state->crtc) {
+		if (old_plane_state && old_plane_state->crtc) {
+			new_crtc_state =
+				drm_atomic_get_crtc_state(state, old_plane_state->crtc);
+			if (IS_ERR(new_crtc_state))
+				return PTR_ERR(new_crtc_state);
+		}
+		return 0;
+	}
+
+	if (new_plane_state->crtc != &zdev->crtc)
+		return -EINVAL;
+
+	new_crtc_state =
+		drm_atomic_get_crtc_state(state, new_plane_state->crtc);
+	if (IS_ERR(new_crtc_state))
+		return PTR_ERR(new_crtc_state);
+
+	ret = drm_atomic_helper_check_plane_state(new_plane_state,
+						  new_crtc_state,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  false, false);
+	if (ret)
+		return ret;
+	if (!new_plane_state->visible)
+		return -EINVAL;
+
+	fb = new_plane_state->fb;
+	if (fb->format->format != DRM_FORMAT_XRGB8888 ||
+	    fb->format->num_planes != 1 ||
+	    fb->modifier != DRM_FORMAT_MOD_LINEAR ||
+	    fb->width != ZUMA_HANDOFF_FB_WIDTH ||
+	    fb->height != ZUMA_HANDOFF_FB_HEIGHT ||
+	    fb->pitches[0] != ZUMA_HANDOFF_FB_STRIDE || fb->offsets[0] ||
+	    new_plane_state->src_x || new_plane_state->src_y ||
+	    new_plane_state->src_w != ZUMA_HANDOFF_FB_WIDTH << 16 ||
+	    new_plane_state->src_h != ZUMA_HANDOFF_FB_HEIGHT << 16 ||
+	    new_plane_state->crtc_x || new_plane_state->crtc_y ||
+	    new_plane_state->crtc_w != ZUMA_HANDOFF_FB_WIDTH ||
+	    new_plane_state->crtc_h != ZUMA_HANDOFF_FB_HEIGHT ||
+	    new_plane_state->rotation != DRM_MODE_ROTATE_0)
+		return -EINVAL;
+
+	return 0;
+}
+
+static void
+zuma_drm_primary_plane_atomic_update(struct drm_plane *plane,
+				     struct drm_atomic_commit *state)
+{
+	/* The fallible copy and trigger completed before the state swap. */
+}
+
+static enum drm_mode_status
+zuma_drm_crtc_mode_valid(struct drm_crtc *crtc,
+			 const struct drm_display_mode *mode)
+{
+	return drm_crtc_helper_mode_valid_fixed(crtc, mode,
+						&zuma_drm_fixed_mode);
+}
+
+static int zuma_drm_crtc_atomic_check(struct drm_crtc *crtc,
+				      struct drm_atomic_commit *state)
+{
+	struct zuma_drm *zdev = container_of(crtc, struct zuma_drm, crtc);
+	struct drm_connector_state *connector_state;
+	struct drm_plane_state *plane_state;
+	struct drm_crtc_state *old_crtc_state;
+	struct drm_crtc_state *new_crtc_state;
+
+	old_crtc_state = drm_atomic_get_old_crtc_state(state, crtc);
+	new_crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	new_crtc_state->no_vblank = true;
+
+	if (!new_crtc_state->enable) {
+		if (old_crtc_state->enable || new_crtc_state->active)
+			return -EOPNOTSUPP;
+		return 0;
+	}
+
+	if (!old_crtc_state->enable && !new_crtc_state->active)
+		return -EINVAL;
+	if (old_crtc_state->enable &&
+	    (new_crtc_state->mode_changed ||
+	     new_crtc_state->connectors_changed))
+		return -EOPNOTSUPP;
+	if (old_crtc_state->active && !new_crtc_state->active)
+		return -EOPNOTSUPP;
+	if (!drm_mode_equal(&new_crtc_state->mode, &zuma_drm_fixed_mode) ||
+	    !drm_mode_equal(&new_crtc_state->adjusted_mode,
+			    &zuma_drm_fixed_mode))
+		return -EINVAL;
+
+	connector_state =
+		drm_atomic_get_connector_state(state, &zdev->connector);
+	if (IS_ERR(connector_state))
+		return PTR_ERR(connector_state);
+	if (connector_state->crtc != crtc)
+		return -EINVAL;
+
+	plane_state = drm_atomic_get_plane_state(state, &zdev->primary_plane);
+	if (IS_ERR(plane_state))
+		return PTR_ERR(plane_state);
+	if (!old_crtc_state->enable &&
+	    (plane_state->crtc != crtc || !plane_state->fb))
+		return -EINVAL;
+
+	return 0;
+}
+
+static const struct drm_plane_helper_funcs zuma_drm_primary_plane_helper_funcs = {
+	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
+	.atomic_check = zuma_drm_primary_plane_atomic_check,
+	.atomic_update = zuma_drm_primary_plane_atomic_update,
+};
+
+static const struct drm_plane_funcs zuma_drm_primary_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	DRM_GEM_SHADOW_PLANE_FUNCS,
+};
+
+static const struct drm_crtc_helper_funcs zuma_drm_crtc_helper_funcs = {
+	.mode_valid = zuma_drm_crtc_mode_valid,
+	.atomic_check = zuma_drm_crtc_atomic_check,
+};
+
+static const struct drm_crtc_funcs zuma_drm_crtc_funcs = {
+	.reset = drm_atomic_helper_crtc_reset,
+	.destroy = drm_crtc_cleanup,
+	.set_config = drm_atomic_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+};
+
+static const struct drm_encoder_funcs zuma_drm_encoder_funcs = {
+	.destroy = drm_encoder_cleanup,
+};
+
+static const struct drm_connector_helper_funcs zuma_drm_connector_helper_funcs = {
+	.get_modes = zuma_drm_connector_get_modes,
+};
+
+static const struct drm_connector_funcs zuma_drm_connector_funcs = {
+	.detect = zuma_drm_connector_detect,
+	.fill_modes = drm_helper_probe_single_connector_modes,
+	.destroy = drm_connector_cleanup,
+	.reset = drm_atomic_helper_connector_reset,
+	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+};
+
+static int zuma_drm_atomic_commit(struct drm_device *drm,
+				  struct drm_atomic_commit *state,
+				  bool nonblock);
+
+static const struct drm_mode_config_funcs zuma_drm_mode_config_funcs = {
+	.fb_create = drm_gem_fb_create_with_dirty,
+	.atomic_check = drm_atomic_helper_check,
+	.atomic_commit = zuma_drm_atomic_commit,
+};
+
+DEFINE_DRM_GEM_FOPS(zuma_drm_fops);
+
+static const struct drm_driver zuma_drm_driver = {
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	.name = "zuma-display-handoff",
+	.desc = "Google Zuma display bootloader handoff",
+	.major = 1,
+	.minor = 0,
+	.driver_features = DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
+	.fops = &zuma_drm_fops,
+};
+
+static int zuma_drm_register(void)
+{
+	struct drm_connector *connector;
+	struct drm_device *drm;
+	struct zuma_drm *zdev;
+	int ret;
+
+	if (zuma_drm_device)
+		return -EALREADY;
+
+	zuma_drm_root = root_device_register("zuma-display-handoff");
+	if (IS_ERR(zuma_drm_root)) {
+		ret = PTR_ERR(zuma_drm_root);
+		zuma_drm_root = NULL;
+		return ret;
+	}
+
+	zdev = devm_drm_dev_alloc(zuma_drm_root, &zuma_drm_driver,
+				  struct zuma_drm, drm);
+	if (IS_ERR(zdev)) {
+		ret = PTR_ERR(zdev);
+		goto err_unregister_root;
+	}
+
+	drm = &zdev->drm;
+	ret = drmm_mode_config_init(drm);
+	if (ret)
+		goto err_unregister_root;
+
+	drm->mode_config.min_width = ZUMA_HANDOFF_FB_WIDTH;
+	drm->mode_config.max_width = ZUMA_HANDOFF_FB_WIDTH;
+	drm->mode_config.min_height = ZUMA_HANDOFF_FB_HEIGHT;
+	drm->mode_config.max_height = ZUMA_HANDOFF_FB_HEIGHT;
+	drm->mode_config.preferred_depth = 24;
+	drm->mode_config.funcs = &zuma_drm_mode_config_funcs;
+
+	ret = drm_universal_plane_init(drm, &zdev->primary_plane, 0,
+				       &zuma_drm_primary_plane_funcs,
+				       zuma_drm_primary_plane_formats,
+				       ARRAY_SIZE(zuma_drm_primary_plane_formats),
+				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		goto err_unregister_root;
+
+	drm_plane_helper_add(&zdev->primary_plane,
+			     &zuma_drm_primary_plane_helper_funcs);
+	drm_plane_enable_fb_damage_clips(&zdev->primary_plane);
+
+	ret = drm_crtc_init_with_planes(drm, &zdev->crtc,
+					&zdev->primary_plane, NULL,
+					&zuma_drm_crtc_funcs, NULL);
+	if (ret)
+		goto err_unregister_root;
+
+	drm_crtc_helper_add(&zdev->crtc, &zuma_drm_crtc_helper_funcs);
+
+	ret = drm_encoder_init(drm, &zdev->encoder, &zuma_drm_encoder_funcs,
+			       DRM_MODE_ENCODER_DSI, NULL);
+	if (ret)
+		goto err_unregister_root;
+
+	zdev->encoder.possible_crtcs = drm_crtc_mask(&zdev->crtc);
+
+	connector = &zdev->connector;
+	ret = drm_connector_init(drm, connector, &zuma_drm_connector_funcs,
+				 DRM_MODE_CONNECTOR_DSI);
+	if (ret)
+		goto err_unregister_root;
+
+	drm_connector_helper_add(connector, &zuma_drm_connector_helper_funcs);
+	connector->display_info.width_mm = ZUMA_DRM_MODE_WIDTH_MM;
+	connector->display_info.height_mm = ZUMA_DRM_MODE_HEIGHT_MM;
+
+	ret = drm_connector_attach_encoder(connector, &zdev->encoder);
+	if (ret)
+		goto err_unregister_root;
+
+	drm_mode_config_reset(drm);
+	dev_set_drvdata(zuma_drm_root, zdev);
+
+	ret = drm_dev_register(drm, 0);
+	if (ret)
+		goto err_unregister_root;
+
+	zuma_drm_device = zdev;
+	pr_info("zuma-display-handoff: registered DRM-only fixed-mode shadow updates; blocking commits only\n");
+	return 0;
+
+err_unregister_root:
+	root_device_unregister(zuma_drm_root);
+	zuma_drm_root = NULL;
+	return ret;
+}
+
+static void zuma_drm_try_register(void)
+{
+	int ret = 0;
+
+	mutex_lock(&zuma_drm_registration_lock);
+	if (zuma_drm_scanout_ready && zuma_drm_initcalls_complete &&
+	    !zuma_drm_device)
+		ret = zuma_drm_register();
+	mutex_unlock(&zuma_drm_registration_lock);
+
+	if (ret)
+		pr_err("zuma-display-handoff: DRM/KMS scaffold registration failed: %d\n",
+		       ret);
+}
+
+/* The built-in DRM core initializes at device-initcall level. */
+static int __init zuma_drm_late_init(void)
+{
+	mutex_lock(&zuma_drm_registration_lock);
+	zuma_drm_initcalls_complete = true;
+	mutex_unlock(&zuma_drm_registration_lock);
+
+	zuma_drm_try_register();
+	return 0;
+}
+late_initcall(zuma_drm_late_init);
 
 static int __init zuma_display_map(struct zuma_display_block *block)
 {
@@ -517,7 +902,7 @@ static bool __init zuma_display_scan_framebuffer(void)
 	center = READ_ONCE(pixels[(ZUMA_HANDOFF_FB_HEIGHT / 2) *
 				 ZUMA_HANDOFF_FB_WIDTH + ZUMA_HANDOFF_FB_WIDTH / 2]);
 	bottom_right = READ_ONCE(pixels[ZUMA_HANDOFF_FB_PIXELS - 1]);
-	memunmap((void *)pixels);
+	zuma_boot_buffer = pixels;
 
 	pr_info("zuma-display-handoff: framebuffer read-only scan base=%pa size=%#zx pixels=%u zero=%llu opaque-black=%llu opaque-white=%llu alpha-ff=%llu nonblack=%llu\n",
 		&fb_base, (size_t)ZUMA_HANDOFF_FB_SIZE,
@@ -653,30 +1038,213 @@ static bool zuma_display_update_ready(void)
 						  zuma_framebuffer_ctrl);
 }
 
+static bool zuma_drm_scanout_update_ready(void)
+{
+	return zuma_boot_buffer && zuma_scanout_buffer &&
+	       zuma_framebuffer_phys == ZUMA_SCANOUT_FB_BASE &&
+	       !zuma_drm_update_failed && zuma_display_update_ready();
+}
+
+static int zuma_drm_finish_scanout_update(const char *operation)
+{
+	u32 frame_before = 0, frame_after = 0;
+	int ret;
+
+	arch_sync_dma_for_device(zuma_framebuffer_phys, ZUMA_HANDOFF_FB_SIZE,
+				 DMA_TO_DEVICE);
+	arch_sync_dma_flush();
+
+	ret = zuma_display_request_active_window();
+	if (ret)
+		goto out_latch;
+	ret = zuma_display_trigger_frame(&frame_before, &frame_after);
+	if (ret)
+		goto out_latch;
+	if (!zuma_display_update_ready()) {
+		ret = -EIO;
+		goto out_latch;
+	}
+
+	zuma_drm_update_count++;
+	if (zuma_drm_update_count <= 8)
+		pr_info("zuma-display-handoff: DRM %s %llu bytes=0..%zu frame=%#x->%#x\n",
+			operation, (unsigned long long)zuma_drm_update_count,
+			(size_t)ZUMA_HANDOFF_FB_SIZE - 1,
+			frame_before, frame_after);
+	return 0;
+
+out_latch:
+	zuma_drm_update_failed = true;
+	pr_err("zuma-display-handoff: DRM %s failed closed: %d, frame=%#x\n",
+	       operation, ret, frame_after);
+	return ret;
+}
+
+static int zuma_drm_commit_shadow(struct drm_atomic_commit *state)
+{
+	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
+	struct drm_shadow_plane_state *shadow_plane_state;
+	struct drm_plane_state *new_plane_state;
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_framebuffer *fb;
+	int ret;
+
+	new_plane_state =
+		drm_atomic_get_new_plane_state(state, &zdev->primary_plane);
+	if (!new_plane_state)
+		return 0;
+
+	if (!new_plane_state->crtc || !new_plane_state->fb)
+		return 0;
+
+	new_crtc_state =
+		drm_atomic_get_new_crtc_state(state, new_plane_state->crtc);
+	if (!new_crtc_state || !new_crtc_state->active)
+		return 0;
+
+	fb = new_plane_state->fb;
+	shadow_plane_state = to_drm_shadow_plane_state(new_plane_state);
+	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+	if (ret)
+		return ret;
+
+	mutex_lock(&zuma_display_mmio_lock);
+	if (!zuma_drm_scanout_update_ready()) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	iosys_map_memcpy_from(zuma_scanout_buffer,
+			      &shadow_plane_state->data[0], 0,
+			      ZUMA_HANDOFF_FB_SIZE);
+	ret = zuma_drm_finish_scanout_update("shadow update");
+
+out_unlock:
+	mutex_unlock(&zuma_display_mmio_lock);
+	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+	return ret;
+}
+
+static int zuma_drm_restore_boot_buffer(void)
+{
+	int ret;
+
+	mutex_lock(&zuma_display_mmio_lock);
+	if (!zuma_drm_scanout_update_ready()) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	memcpy(zuma_scanout_buffer, zuma_boot_buffer,
+	       ZUMA_HANDOFF_FB_SIZE);
+	if (memcmp(zuma_scanout_buffer, zuma_boot_buffer,
+		   ZUMA_HANDOFF_FB_SIZE)) {
+		ret = -EIO;
+		zuma_drm_update_failed = true;
+		pr_err("zuma-display-handoff: DRM boot restore copy failed closed\n");
+		goto out_unlock;
+	}
+
+	ret = zuma_drm_finish_scanout_update("boot restore");
+
+out_unlock:
+	mutex_unlock(&zuma_display_mmio_lock);
+	return ret;
+}
+
+static void zuma_drm_commit_tail(struct drm_atomic_commit *state)
+{
+	struct drm_device *drm = state->dev;
+
+	drm_atomic_helper_commit_modeset_disables(drm, state);
+	drm_atomic_helper_commit_planes(drm, state, 0);
+	drm_atomic_helper_commit_modeset_enables(drm, state);
+	drm_atomic_helper_fake_vblank(state);
+	drm_atomic_helper_commit_hw_done(state);
+	drm_atomic_helper_wait_for_flip_done(drm, state);
+	drm_atomic_helper_cleanup_planes(drm, state);
+	drm_atomic_helper_commit_cleanup_done(state);
+}
+
+static int zuma_drm_atomic_commit(struct drm_device *drm,
+				  struct drm_atomic_commit *state,
+				  bool nonblock)
+{
+	struct zuma_drm *zdev = container_of(drm, struct zuma_drm, drm);
+	struct drm_plane_state *old_plane_state;
+	struct drm_plane_state *new_plane_state;
+	bool restore_boot;
+	int ret;
+
+	if (nonblock)
+		return -EOPNOTSUPP;
+
+	old_plane_state =
+		drm_atomic_get_old_plane_state(state, &zdev->primary_plane);
+	new_plane_state =
+		drm_atomic_get_new_plane_state(state, &zdev->primary_plane);
+	restore_boot = old_plane_state && old_plane_state->fb &&
+		new_plane_state && !new_plane_state->fb;
+
+	ret = drm_atomic_helper_setup_commit(state, false);
+	if (ret)
+		return ret;
+
+	ret = drm_atomic_helper_prepare_planes(drm, state);
+	if (ret)
+		return ret;
+
+	ret = drm_atomic_helper_wait_for_fences(drm, state, true);
+	if (ret)
+		goto out_unprepare;
+	drm_atomic_helper_wait_for_dependencies(state);
+
+	if (restore_boot)
+		ret = zuma_drm_restore_boot_buffer();
+	else
+		ret = zuma_drm_commit_shadow(state);
+	if (ret)
+		goto out_unprepare;
+
+	ret = drm_atomic_helper_swap_state(state, false);
+	if (WARN_ON(ret)) {
+		mutex_lock(&zuma_display_mmio_lock);
+		zuma_drm_update_failed = true;
+		mutex_unlock(&zuma_display_mmio_lock);
+		goto out_unprepare;
+	}
+
+	drm_atomic_commit_get(state);
+	zuma_drm_commit_tail(state);
+	drm_atomic_commit_put(state);
+	return 0;
+
+out_unprepare:
+	drm_atomic_helper_unprepare_planes(drm, state);
+	return ret;
+}
+
 static bool __init zuma_flip_buffer_valid(void)
 {
 	phys_addr_t base = zuma_husky_flip_framebuffer_base;
 	unsigned long pfn, end_pfn;
 
-	if (!base || !IS_ALIGNED(base, ZUMA_FLIP_FB_ALIGNMENT) ||
-	    base > ZUMA_HANDOFF_FB_BASE - ZUMA_FLIP_FB_ALLOC_SIZE ||
-	    base >= BIT_ULL(32) ||
-	    base > BIT_ULL(32) - ZUMA_FLIP_FB_ALLOC_SIZE) {
-		pr_err("zuma-display-handoff: refusing invalid flip framebuffer base %pa\n",
+	if (base != ZUMA_SCANOUT_FB_BASE) {
+		pr_err("zuma-display-handoff: refusing unexpected flip framebuffer base %pa\n",
 		       &base);
 		return false;
 	}
 
-	if (region_intersects(base, ZUMA_FLIP_FB_ALLOC_SIZE,
+	if (region_intersects(base, ZUMA_HANDOFF_FB_SIZE,
 			      IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) !=
 	    REGION_INTERSECTS) {
-		pr_err("zuma-display-handoff: flip framebuffer %pa+%#x is not System RAM\n",
-		       &base, ZUMA_FLIP_FB_ALLOC_SIZE);
+		pr_err("zuma-display-handoff: flip framebuffer %pa+%#zx is not System RAM\n",
+		       &base, (size_t)ZUMA_HANDOFF_FB_SIZE);
 		return false;
 	}
 
 	pfn = PHYS_PFN(base);
-	end_pfn = PHYS_PFN(base + ZUMA_FLIP_FB_ALLOC_SIZE);
+	end_pfn = PHYS_PFN(base + ZUMA_HANDOFF_FB_SIZE);
 	for (; pfn < end_pfn; pfn++) {
 		if (!pfn_is_map_memory(pfn)) {
 			pr_err("zuma-display-handoff: flip framebuffer PFN %#lx is not direct-mapped RAM\n",
@@ -828,7 +1396,8 @@ static int zuma_display_rollback_format(u32 *ctrl_after,
 static bool __init zuma_display_flip_to_reserved(void)
 {
 	phys_addr_t new_base = zuma_husky_flip_framebuffer_base;
-	void *source, *destination;
+	const void *source = zuma_boot_buffer;
+	void *destination;
 	u32 frame_before = 0, frame_after = 0;
 	u32 rollback_before = 0, rollback_after = 0;
 	int rollback_ret;
@@ -839,20 +1408,12 @@ static bool __init zuma_display_flip_to_reserved(void)
 		return false;
 	}
 
-	if (!zuma_flip_buffer_valid())
+	if (!source || !zuma_flip_buffer_valid())
 		return false;
-
-	source = memremap(ZUMA_HANDOFF_FB_BASE, ZUMA_HANDOFF_FB_SIZE,
-			  MEMREMAP_WB);
-	if (!source) {
-		pr_err("zuma-display-handoff: base flip source mapping failed\n");
-		return false;
-	}
 
 	destination = memremap(new_base, ZUMA_HANDOFF_FB_SIZE, MEMREMAP_WB);
 	if (!destination) {
 		pr_err("zuma-display-handoff: base flip destination mapping failed\n");
-		memunmap(source);
 		return false;
 	}
 
@@ -860,18 +1421,16 @@ static bool __init zuma_display_flip_to_reserved(void)
 	if (memcmp(destination, source, ZUMA_HANDOFF_FB_SIZE)) {
 		pr_err("zuma-display-handoff: base flip copy verification failed\n");
 		memunmap(destination);
-		memunmap(source);
 		return false;
 	}
 	arch_sync_dma_for_device(new_base, ZUMA_HANDOFF_FB_SIZE, DMA_TO_DEVICE);
 	arch_sync_dma_flush();
-	memunmap(destination);
-	memunmap(source);
 
 	ret = zuma_display_commit_base(new_base, &frame_before, &frame_after);
 	if (!ret) {
 		zuma_framebuffer_phys = new_base;
 		if (zuma_display_update_ready()) {
+			zuma_scanout_buffer = destination;
 			pr_info("zuma-display-handoff: DPP0 base flip %#x->%pa frame=%#x->%#x, BGRA format unchanged\n",
 				ZUMA_HANDOFF_FB_BASE, &new_base,
 				frame_before, frame_after);
@@ -886,6 +1445,7 @@ static bool __init zuma_display_flip_to_reserved(void)
 						&rollback_before,
 						&rollback_after);
 	zuma_framebuffer_phys = ZUMA_HANDOFF_FB_BASE;
+	memunmap(destination);
 	if (rollback_ret || !zuma_display_update_ready()) {
 		pr_crit("zuma-display-handoff: DPP0 base rollback failed: %d\n",
 			rollback_ret ?: -EIO);
@@ -942,264 +1502,34 @@ static bool zuma_display_switch_to_bgrx(void)
 	return false;
 }
 
-static void zuma_fb_mark_dirty(struct zuma_framebuffer *par,
-			       size_t start, size_t length)
-{
-	unsigned long flags;
-	size_t end;
-
-	if (start >= ZUMA_HANDOFF_FB_SIZE || !length)
-		return;
-	length = min_t(size_t, length, ZUMA_HANDOFF_FB_SIZE - start);
-	end = start + length;
-
-	spin_lock_irqsave(&par->dirty_lock, flags);
-	par->dirty_start = min(par->dirty_start, start);
-	par->dirty_end = max(par->dirty_end, end);
-	spin_unlock_irqrestore(&par->dirty_lock, flags);
-}
-
-static void zuma_fb_mark_rect(struct zuma_framebuffer *par, u32 x, u32 y,
-			      u32 width, u32 height)
-{
-	size_t start, end;
-
-	if (x >= ZUMA_HANDOFF_FB_WIDTH || y >= ZUMA_HANDOFF_FB_HEIGHT ||
-	    !width || !height)
-		return;
-	width = min(width, ZUMA_HANDOFF_FB_WIDTH - x);
-	height = min(height, ZUMA_HANDOFF_FB_HEIGHT - y);
-	start = y * ZUMA_HANDOFF_FB_STRIDE + x * sizeof(u32);
-	end = (y + height - 1) * ZUMA_HANDOFF_FB_STRIDE +
-	      (x + width) * sizeof(u32);
-	zuma_fb_mark_dirty(par, start, end - start);
-}
-
-static int zuma_fb_submit_update(struct fb_info *info)
-{
-	struct zuma_framebuffer *par = info->par;
-	unsigned long flags;
-	size_t start, end;
-	u32 frame_before, frame_after;
-	int ret = 0;
-
-	mutex_lock(&zuma_display_mmio_lock);
-
-	spin_lock_irqsave(&par->dirty_lock, flags);
-	start = par->dirty_start;
-	end = par->dirty_end;
-	par->dirty_start = ZUMA_HANDOFF_FB_SIZE;
-	par->dirty_end = 0;
-	spin_unlock_irqrestore(&par->dirty_lock, flags);
-
-	if (start >= end)
-		goto out_unlock;
-
-	if (!zuma_display_update_ready()) {
-		ret = -EIO;
-		goto out_requeue;
-	}
-
-	arch_sync_dma_for_device(zuma_framebuffer_phys + start, end - start,
-				 DMA_TO_DEVICE);
-	arch_sync_dma_flush();
-
-	ret = zuma_display_request_active_window();
-	if (ret) {
-		pr_err_ratelimited("zuma-display-handoff: framebuffer window update request failed: %d\n",
-				   ret);
-		goto out_requeue;
-	}
-
-	ret = zuma_display_trigger_frame(&frame_before, &frame_after);
-	if (ret) {
-		pr_err_ratelimited("zuma-display-handoff: framebuffer update did not complete: %d, frame=%#x\n",
-				   ret, frame_after);
-		goto out_requeue;
-	}
-
-	par->update_count++;
-	if (par->update_count <= 8)
-		pr_info("zuma-display-handoff: fb update %llu bytes=%zu..%zu frame=%#x->%#x\n",
-			(unsigned long long)par->update_count, start, end - 1,
-			frame_before, frame_after);
-	goto out_unlock;
-
-out_requeue:
-	zuma_fb_mark_dirty(par, start, end - start);
-out_unlock:
-	mutex_unlock(&zuma_display_mmio_lock);
-	return ret;
-}
-
-static void zuma_fb_queue_update(struct fb_info *info)
-{
-	mod_delayed_work(system_wq, &info->deferred_work,
-			 msecs_to_jiffies(ZUMA_FB_FLUSH_DELAY_MS));
-}
-
-static ssize_t zuma_fb_read(struct fb_info *info, char __user *buf,
-			    size_t count, loff_t *ppos)
-{
-	return simple_read_from_buffer(buf, count, ppos, info->screen_buffer,
-				       info->screen_size);
-}
-
-static ssize_t zuma_fb_write(struct fb_info *info, const char __user *buf,
-			     size_t count, loff_t *ppos)
-{
-	struct zuma_framebuffer *par = info->par;
-	loff_t start = *ppos;
-	ssize_t ret;
-
-	ret = simple_write_to_buffer(info->screen_buffer, info->screen_size,
-				     ppos, buf, count);
-	if (ret > 0) {
-		zuma_fb_mark_dirty(par, start, ret);
-		zuma_fb_queue_update(info);
-	}
-	return ret;
-}
-
-static void zuma_fb_fillrect(struct fb_info *info,
-			     const struct fb_fillrect *rect)
-{
-	sys_fillrect(info, rect);
-	zuma_fb_mark_rect(info->par, rect->dx, rect->dy,
-			  rect->width, rect->height);
-	zuma_fb_queue_update(info);
-}
-
-static void zuma_fb_copyarea(struct fb_info *info,
-			     const struct fb_copyarea *area)
-{
-	sys_copyarea(info, area);
-	zuma_fb_mark_rect(info->par, area->dx, area->dy,
-			  area->width, area->height);
-	zuma_fb_queue_update(info);
-}
-
-static void zuma_fb_imageblit(struct fb_info *info,
-			      const struct fb_image *image)
-{
-	sys_imageblit(info, image);
-	zuma_fb_mark_rect(info->par, image->dx, image->dy,
-			  image->width, image->height);
-	zuma_fb_queue_update(info);
-}
-
-static int zuma_fb_sync(struct fb_info *info)
-{
-	flush_delayed_work(&info->deferred_work);
-	return zuma_fb_submit_update(info);
-}
-
-static int zuma_fb_ioctl(struct fb_info *info, unsigned int cmd,
-			 unsigned long arg)
-{
-	if (cmd == FBIO_WAITFORVSYNC)
-		return zuma_fb_sync(info);
-	return -ENOTTY;
-}
-
-static int zuma_fb_check_var(struct fb_var_screeninfo *var,
-			     struct fb_info *info)
-{
-	if (var->xres != ZUMA_HANDOFF_FB_WIDTH ||
-	    var->yres != ZUMA_HANDOFF_FB_HEIGHT ||
-	    var->bits_per_pixel != 32)
-		return -EINVAL;
-
-	var->xres_virtual = ZUMA_HANDOFF_FB_WIDTH;
-	var->yres_virtual = ZUMA_HANDOFF_FB_HEIGHT;
-	var->xoffset = 0;
-	var->yoffset = 0;
-	var->red = info->var.red;
-	var->green = info->var.green;
-	var->blue = info->var.blue;
-	var->transp = info->var.transp;
-	return 0;
-}
-
-static int zuma_fb_set_par(struct fb_info *info)
-{
-	return 0;
-}
-
-static int zuma_fb_setcolreg(unsigned int regno, unsigned int red,
-			     unsigned int green, unsigned int blue,
-			     unsigned int transp, struct fb_info *info)
-{
-	u32 *palette = info->pseudo_palette;
-	u32 value;
-
-	if (regno >= ZUMA_FB_PALETTE_SIZE)
-		return -EINVAL;
-
-	value = ((red >> 8) << info->var.red.offset) |
-		((green >> 8) << info->var.green.offset) |
-		((blue >> 8) << info->var.blue.offset);
-	if (info->var.transp.length)
-		value |= 0xffU << info->var.transp.offset;
-	palette[regno] = value;
-	return 0;
-}
-
-static int zuma_fb_blank(int blank, struct fb_info *info)
-{
-	return blank == FB_BLANK_UNBLANK ? 0 : -EINVAL;
-}
-
-static int zuma_fb_pan_display(struct fb_var_screeninfo *var,
-			       struct fb_info *info)
-{
-	return (var->xoffset || var->yoffset) ? -EINVAL : 0;
-}
-
-static void zuma_fb_deferred_io(struct fb_info *info,
-				struct list_head *pagelist)
-{
-	struct zuma_framebuffer *par = info->par;
-	struct fb_deferred_io_pageref *pageref;
-
-	list_for_each_entry(pageref, pagelist, list)
-		zuma_fb_mark_dirty(par, pageref->offset, PAGE_SIZE);
-	zuma_fb_submit_update(info);
-}
-
-static const struct fb_ops zuma_fb_ops = {
-	.owner = THIS_MODULE,
-	.fb_read = zuma_fb_read,
-	.fb_write = zuma_fb_write,
-	.fb_check_var = zuma_fb_check_var,
-	.fb_set_par = zuma_fb_set_par,
-	.fb_setcolreg = zuma_fb_setcolreg,
-	.fb_blank = zuma_fb_blank,
-	.fb_pan_display = zuma_fb_pan_display,
-	.fb_fillrect = zuma_fb_fillrect,
-	.fb_copyarea = zuma_fb_copyarea,
-	.fb_imageblit = zuma_fb_imageblit,
-	.fb_sync = zuma_fb_sync,
-	.fb_ioctl = zuma_fb_ioctl,
-	.fb_mmap = fb_deferred_io_mmap,
-};
-
-static struct fb_deferred_io zuma_fb_defio = {
-	.deferred_io = zuma_fb_deferred_io,
-};
-
 static void zuma_display_format_workfn(struct work_struct *work)
 {
-	bool register_fb;
+	bool publish_drm;
 
 	mutex_lock(&zuma_display_mmio_lock);
 	if (zuma_framebuffer_validated)
 		zuma_framebuffer_validated = zuma_display_switch_to_bgrx();
-	register_fb = zuma_framebuffer_validated;
+	if (zuma_framebuffer_validated &&
+	    (!zuma_boot_buffer || !zuma_scanout_buffer ||
+	     zuma_framebuffer_phys != ZUMA_SCANOUT_FB_BASE)) {
+		pr_err("zuma-display-handoff: DRM scanout mappings failed final validation\n");
+		zuma_framebuffer_validated = false;
+	} else if (zuma_framebuffer_validated &&
+		   memcmp(zuma_scanout_buffer, zuma_boot_buffer,
+			  ZUMA_HANDOFF_FB_SIZE)) {
+		pr_err("zuma-display-handoff: DRM scanout differs from immutable boot buffer\n");
+		zuma_framebuffer_validated = false;
+	}
+	publish_drm = zuma_framebuffer_validated;
 	mutex_unlock(&zuma_display_mmio_lock);
 
-	if (register_fb)
-		zuma_framebuffer_register();
+	if (!publish_drm)
+		return;
+
+	mutex_lock(&zuma_drm_registration_lock);
+	zuma_drm_scanout_ready = true;
+	mutex_unlock(&zuma_drm_registration_lock);
+	zuma_drm_try_register();
 }
 
 static void zuma_display_snapshot_workfn(struct work_struct *work)
@@ -1254,9 +1584,9 @@ static int __init zuma_display_handoff_init(void)
 
 	pr_info("zuma-display-handoff: guarded Zuma/Husky handoff active\n");
 	if (zuma_husky_flip_framebuffer_base)
-		pr_info("zuma-display-handoff: reserved flip framebuffer at %pa, size=%#x\n",
+		pr_info("zuma-display-handoff: reserved scanout framebuffer at %pa, size=%#zx\n",
 			&zuma_husky_flip_framebuffer_base,
-			ZUMA_FLIP_FB_ALLOC_SIZE);
+			(size_t)ZUMA_HANDOFF_FB_SIZE);
 	else
 		pr_warn("zuma-display-handoff: flip framebuffer reservation unavailable\n");
 	mutex_lock(&zuma_display_mmio_lock);
@@ -1282,98 +1612,3 @@ out_unmap:
 	return 0;
 }
 early_initcall(zuma_display_handoff_init);
-
-static int zuma_framebuffer_register(void)
-{
-	struct zuma_framebuffer *par;
-	struct fb_info *info;
-	void *screen_buffer;
-	int ret;
-
-	if (!zuma_framebuffer_validated)
-		return 0;
-
-	mutex_lock(&zuma_display_mmio_lock);
-	if (!zuma_display_update_ready()) {
-		mutex_unlock(&zuma_display_mmio_lock);
-		pr_err("zuma-display-handoff: framebuffer registration refused by handoff state\n");
-		return 0;
-	}
-	mutex_unlock(&zuma_display_mmio_lock);
-
-	screen_buffer = memremap(zuma_framebuffer_phys,
-				 ZUMA_HANDOFF_FB_SIZE, MEMREMAP_WB);
-	if (!screen_buffer) {
-		pr_err("zuma-display-handoff: framebuffer mapping failed\n");
-		return 0;
-	}
-
-	info = framebuffer_alloc(sizeof(*par), NULL);
-	if (!info) {
-		memunmap(screen_buffer);
-		return 0;
-	}
-
-	par = info->par;
-	par->info = info;
-	spin_lock_init(&par->dirty_lock);
-	par->dirty_start = ZUMA_HANDOFF_FB_SIZE;
-
-	strscpy(info->fix.id, "zuma-handoff", sizeof(info->fix.id));
-	info->fix.smem_start = zuma_framebuffer_phys;
-	info->fix.smem_len = ZUMA_HANDOFF_FB_SIZE;
-	info->fix.type = FB_TYPE_PACKED_PIXELS;
-	info->fix.visual = FB_VISUAL_TRUECOLOR;
-	info->fix.line_length = ZUMA_HANDOFF_FB_STRIDE;
-	info->fix.accel = FB_ACCEL_NONE;
-
-	info->var.xres = ZUMA_HANDOFF_FB_WIDTH;
-	info->var.yres = ZUMA_HANDOFF_FB_HEIGHT;
-	info->var.xres_virtual = ZUMA_HANDOFF_FB_WIDTH;
-	info->var.yres_virtual = ZUMA_HANDOFF_FB_HEIGHT;
-	info->var.bits_per_pixel = 32;
-	info->var.red.offset = 16;
-	info->var.red.length = 8;
-	info->var.green.offset = 8;
-	info->var.green.length = 8;
-	info->var.blue.offset = 0;
-	info->var.blue.length = 8;
-	info->var.transp.offset = 24;
-	info->var.transp.length = 0;
-	info->var.height = -1;
-	info->var.width = -1;
-	info->var.activate = FB_ACTIVATE_NOW;
-	info->var.vmode = FB_VMODE_NONINTERLACED;
-
-	info->fbops = &zuma_fb_ops;
-	info->screen_buffer = screen_buffer;
-	info->screen_size = ZUMA_HANDOFF_FB_SIZE;
-	info->pseudo_palette = par->palette;
-	info->flags = FBINFO_VIRTFB | FBINFO_READS_FAST |
-		      FBINFO_HWACCEL_DISABLED;
-	info->skip_panic = true;
-	info->fbdefio = &zuma_fb_defio;
-	zuma_fb_defio.delay = max_t(unsigned long, 1,
-				    msecs_to_jiffies(ZUMA_FB_FLUSH_DELAY_MS));
-
-	ret = fb_deferred_io_init(info);
-	if (ret)
-		goto out_release;
-
-	ret = register_framebuffer(info);
-	if (ret)
-		goto out_defio;
-
-	pr_info("zuma-display-handoff: fb%d registered at %pa, %ux%u BGRX8888, stride=%zu\n",
-		info->node, &zuma_framebuffer_phys, ZUMA_HANDOFF_FB_WIDTH,
-		ZUMA_HANDOFF_FB_HEIGHT, (size_t)ZUMA_HANDOFF_FB_STRIDE);
-	return 0;
-
-out_defio:
-	fb_deferred_io_cleanup(info);
-out_release:
-	framebuffer_release(info);
-	memunmap(screen_buffer);
-	pr_err("zuma-display-handoff: framebuffer registration failed: %d\n", ret);
-	return 0;
-}
