@@ -4,8 +4,8 @@
  *
  * The shipping boot chain leaves a working HK3 command-mode display pipeline.
  * Until native Zuma DRM/KMS support exists, preserve that state and expose its
- * reserved linear buffer through fbdev.  Framebuffer updates retain the exact
- * inherited DPP/DECON/DSIM configuration and only admit a hardware trigger.
+ * reserved linear buffer through fbdev.  Initial adoption may copy and switch
+ * only the DPP base; later framebuffer updates only admit a hardware trigger.
  */
 
 #include <linux/bitops.h>
@@ -55,6 +55,15 @@
 
 #define ZUMA_DECON0_BASE                0x19470000
 #define ZUMA_DECON0_MIN_SIZE            0x300
+#define ZUMA_DECON0_WINCON_BASE         0x194a0000
+#define ZUMA_DECON0_WINCON_MIN_SIZE     0xe000
+#define ZUMA_DECON0_WINCON_RESOURCE     3
+#define ZUMA_DECON_ACTIVE_WINDOW        5
+#define ZUMA_DECON_WINDOW_COUNT         14
+#define ZUMA_DECON_WINCON_STRIDE        0x1000
+#define ZUMA_DECON_WINCON_ENABLE        BIT(0)
+#define ZUMA_DECON_WINCON_EXPECTED      ZUMA_DECON_WINCON_ENABLE
+#define ZUMA_DECON_SHD_REQ_ACTIVE       BIT(ZUMA_DECON_ACTIVE_WINDOW)
 #define ZUMA_DECON_VERSION              0x0000
 #define ZUMA_DECON_FRAME_COUNT          0x0004
 #define ZUMA_DECON_GLOBAL_CON           0x0020
@@ -72,7 +81,7 @@
 #define ZUMA_DECON_INT_EXPECTED         0x3000
 
 #define ZUMA_DPP0_BASE                  0x19900000
-#define ZUMA_DPP0_MIN_SIZE              0x100
+#define ZUMA_DPP0_MIN_SIZE              0x500
 
 #define ZUMA_SYSMMU_DPUF0_BASE          0x19840000
 #define ZUMA_SYSMMU_DPUF0_MIN_SIZE      0x9000
@@ -85,6 +94,12 @@
 #define ZUMA_SYSMMU_VM_CTRL             0x8000
 #define ZUMA_SYSMMU_VM_FLPT_BASE        0x8404
 #define ZUMA_SYSMMU_VM_ATTRIBUTE        0x8408
+#define ZUMA_SYSMMU_MMU_CTRL_EXPECTED   0x0
+#define ZUMA_SYSMMU_MMU_STATUS_EXPECTED 0x0
+#define ZUMA_SYSMMU_VERSION_EXPECTED    0x90000000
+#define ZUMA_SYSMMU_VM_CTRL_EXPECTED    0x24
+#define ZUMA_SYSMMU_FLPT_EXPECTED       0x0
+#define ZUMA_SYSMMU_ATTRIBUTE_EXPECTED  0x0
 #define ZUMA_DPP_RDMA_ENABLE            0x0000
 #define ZUMA_DPP_RDMA_IN_CTRL_0         0x0008
 #define ZUMA_DPP_RDMA_SRC_WIDTH         0x0010
@@ -92,6 +107,7 @@
 #define ZUMA_DPP_RDMA_SRC_OFFSET        0x0018
 #define ZUMA_DPP_RDMA_IMG_SIZE          0x001c
 #define ZUMA_DPP_RDMA_BASEADDR_P0       0x0040
+#define ZUMA_DPP_RDMA_SHADOW_OFFSET     0x0400
 #define ZUMA_DPP_RDMA_SRC_STRIDE_0      0x0050
 #define ZUMA_DPP_RDMA_EXPECTED          0x40000000
 #define ZUMA_DPP_RDMA_BUSY              BIT(2)
@@ -109,6 +125,7 @@
 #define ZUMA_HANDOFF_FB_STRIDE          \
 	(ZUMA_HANDOFF_FB_WIDTH * sizeof(u32))
 #define ZUMA_FLIP_FB_ALLOC_SIZE         0x01000000
+#define ZUMA_FLIP_FB_ALIGNMENT          0x00100000
 #define ZUMA_FB_FLUSH_DELAY_MS          16
 #define ZUMA_FB_PALETTE_SIZE            16
 
@@ -117,6 +134,7 @@ struct zuma_display_block {
 	const char *compatible;
 	resource_size_t phys;
 	resource_size_t min_size;
+	unsigned int resource_index;
 	void __iomem *base;
 };
 
@@ -132,6 +150,7 @@ struct zuma_framebuffer {
 
 static DEFINE_MUTEX(zuma_display_mmio_lock);
 static bool zuma_framebuffer_validated;
+static phys_addr_t zuma_framebuffer_phys = ZUMA_HANDOFF_FB_BASE;
 
 static struct zuma_display_block zuma_dpub = {
 	.name = "DPUB power domain",
@@ -168,6 +187,14 @@ static struct zuma_display_block zuma_decon0 = {
 	.min_size = ZUMA_DECON0_MIN_SIZE,
 };
 
+static struct zuma_display_block zuma_decon0_wincon = {
+	.name = "DECON0 window control",
+	.compatible = "samsung,exynos-decon",
+	.phys = ZUMA_DECON0_WINCON_BASE,
+	.min_size = ZUMA_DECON0_WINCON_MIN_SIZE,
+	.resource_index = ZUMA_DECON0_WINCON_RESOURCE,
+};
+
 static struct zuma_display_block zuma_dpp0 = {
 	.name = "DPP0 RDMA",
 	.compatible = "samsung,exynos-dpp",
@@ -188,6 +215,7 @@ static struct zuma_display_block * const zuma_display_blocks[] = {
 	&zuma_dpuf1,
 	&zuma_dsim0,
 	&zuma_decon0,
+	&zuma_decon0_wincon,
 	&zuma_dpp0,
 	&zuma_sysmmu_dpuf0,
 };
@@ -218,7 +246,7 @@ static int __init zuma_display_map(struct zuma_display_block *block)
 	int ret;
 
 	while ((np = of_find_compatible_node(np, NULL, block->compatible))) {
-		ret = of_address_to_resource(np, 0, &res);
+		ret = of_address_to_resource(np, block->resource_index, &res);
 		if (ret || res.start != block->phys)
 			continue;
 
@@ -276,6 +304,46 @@ static bool zuma_display_domains_on(u32 *dpub, u32 *dpuf0, u32 *dpuf1)
 	return (*dpub & ZUMA_PD_ON) && (*dpuf0 & ZUMA_PD_ON);
 }
 
+static u32 zuma_decon_wincon_read(unsigned int window)
+{
+	return readl(zuma_decon0_wincon.base +
+		     window * ZUMA_DECON_WINCON_STRIDE);
+}
+
+static bool zuma_display_active_window_valid(void)
+{
+	unsigned int window;
+
+	if (zuma_decon_wincon_read(ZUMA_DECON_ACTIVE_WINDOW) !=
+	    ZUMA_DECON_WINCON_EXPECTED)
+		return false;
+
+	for (window = 0; window < ZUMA_DECON_WINDOW_COUNT; window++) {
+		if (window != ZUMA_DECON_ACTIVE_WINDOW &&
+		    (zuma_decon_wincon_read(window) &
+		     ZUMA_DECON_WINCON_ENABLE))
+			return false;
+	}
+
+	return true;
+}
+
+static bool zuma_display_sysmmu_bypassed(void)
+{
+	return readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_MMU_CTRL) ==
+			ZUMA_SYSMMU_MMU_CTRL_EXPECTED &&
+	       readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_MMU_STATUS) ==
+			ZUMA_SYSMMU_MMU_STATUS_EXPECTED &&
+	       readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_MMU_VERSION) ==
+			ZUMA_SYSMMU_VERSION_EXPECTED &&
+	       readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_VM_CTRL) ==
+			ZUMA_SYSMMU_VM_CTRL_EXPECTED &&
+	       readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_VM_FLPT_BASE) ==
+			ZUMA_SYSMMU_FLPT_EXPECTED &&
+	       readl(zuma_sysmmu_dpuf0.base + ZUMA_SYSMMU_VM_ATTRIBUTE) ==
+			ZUMA_SYSMMU_ATTRIBUTE_EXPECTED;
+}
+
 static void zuma_display_snapshot(const char *label)
 {
 	u32 dpub, dpuf0, dpuf1;
@@ -297,9 +365,13 @@ static void zuma_display_snapshot(const char *label)
 		readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON),
 		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_0),
 		readl(zuma_decon0.base + ZUMA_DECON_OF_PIXEL_ORDER));
+	pr_info("zuma-display-handoff: %s DECON active-window=%u wincon=%#x shadow-request=%#x\n",
+		label, ZUMA_DECON_ACTIVE_WINDOW,
+		zuma_decon_wincon_read(ZUMA_DECON_ACTIVE_WINDOW),
+		readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ));
 
 	rdma_ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0);
-	pr_info("zuma-display-handoff: %s DPP0 enable=%#x ctrl=%#x format=%u src=%#xx%#x offset=%#x image=%#x base=%#x stride=%#x\n",
+	pr_info("zuma-display-handoff: %s DPP0 enable=%#x ctrl=%#x format=%u src=%#xx%#x offset=%#x image=%#x base=%#x shadow=%#x stride=%#x\n",
 		label,
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE),
 		rdma_ctrl,
@@ -309,6 +381,8 @@ static void zuma_display_snapshot(const char *label)
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_SRC_OFFSET),
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IMG_SIZE),
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0),
+		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0 +
+		      ZUMA_DPP_RDMA_SHADOW_OFFSET),
 		readl(zuma_dpp0.base + ZUMA_DPP_RDMA_SRC_STRIDE_0));
 
 	pr_info("zuma-display-handoff: %s DPUF0 SysMMU ctrl=%#x status=%#x version=%#x pmmu_sel=%#x pmmu=%#x swalker=%#x vm_ctrl=%#x flpt=%#x attr=%#x\n",
@@ -485,6 +559,49 @@ static int zuma_display_wait_idle(void)
 			!(value & ZUMA_DSIM_MIPI_FRAME_PROCESSING), 10, 100000);
 }
 
+static int zuma_display_request_active_window(void)
+{
+	writel(ZUMA_DECON_SHD_REQ_ACTIVE,
+	       zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	if (readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ) !=
+	    ZUMA_DECON_SHD_REQ_ACTIVE)
+		return -EIO;
+
+	return 0;
+}
+
+static int zuma_display_trigger_frame(u32 *frame_before, u32 *frame_after)
+{
+	u32 value;
+	int ret;
+
+	*frame_before = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	*frame_after = *frame_before;
+	zuma_display_set_hw_trigger(true);
+	ret = readl_poll_timeout_atomic(zuma_decon0.base +
+			ZUMA_DECON_FRAME_COUNT, *frame_after,
+			*frame_after != *frame_before, 1, 50000);
+	zuma_display_set_hw_trigger(false);
+	if (ret)
+		return ret;
+
+	ret = zuma_display_wait_idle();
+	if (ret)
+		return ret;
+
+	ret = readl_poll_timeout_atomic(zuma_decon0.base +
+			ZUMA_DECON_SHD_REG_UP_REQ, value, !value,
+			10, 100000);
+	if (ret)
+		return ret;
+
+	if (readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) !=
+	    ZUMA_DECON_TRIG_EXPECTED)
+		return -EIO;
+
+	return 0;
+}
+
 static bool zuma_display_update_ready(void)
 {
 	u32 dpub, dpuf0, dpuf1;
@@ -501,8 +618,158 @@ static bool zuma_display_update_ready(void)
 			ZUMA_DECON_INT_EXPECTED &&
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) ==
 			ZUMA_DPP_RDMA_EXPECTED &&
+	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0) ==
+			lower_32_bits(zuma_framebuffer_phys) &&
+	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0 +
+		     ZUMA_DPP_RDMA_SHADOW_OFFSET) ==
+			lower_32_bits(zuma_framebuffer_phys) &&
+	       zuma_display_active_window_valid() &&
+	       zuma_display_sysmmu_bypassed() &&
 	       !readl(zuma_dsim0.base + ZUMA_DSIM_LINK_STATUS1) &&
 	       !readl(zuma_dsim0.base + ZUMA_DSIM_MIPI_STATUS);
+}
+
+static bool __init zuma_flip_buffer_valid(void)
+{
+	phys_addr_t base = zuma_husky_flip_framebuffer_base;
+	unsigned long pfn, end_pfn;
+
+	if (!base || !IS_ALIGNED(base, ZUMA_FLIP_FB_ALIGNMENT) ||
+	    base > ZUMA_HANDOFF_FB_BASE - ZUMA_FLIP_FB_ALLOC_SIZE ||
+	    base >= BIT_ULL(32) ||
+	    base > BIT_ULL(32) - ZUMA_FLIP_FB_ALLOC_SIZE) {
+		pr_err("zuma-display-handoff: refusing invalid flip framebuffer base %pa\n",
+		       &base);
+		return false;
+	}
+
+	if (region_intersects(base, ZUMA_FLIP_FB_ALLOC_SIZE,
+			      IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE) !=
+	    REGION_INTERSECTS) {
+		pr_err("zuma-display-handoff: flip framebuffer %pa+%#x is not System RAM\n",
+		       &base, ZUMA_FLIP_FB_ALLOC_SIZE);
+		return false;
+	}
+
+	pfn = PHYS_PFN(base);
+	end_pfn = PHYS_PFN(base + ZUMA_FLIP_FB_ALLOC_SIZE);
+	for (; pfn < end_pfn; pfn++) {
+		if (!pfn_is_map_memory(pfn)) {
+			pr_err("zuma-display-handoff: flip framebuffer PFN %#lx is not direct-mapped RAM\n",
+			       pfn);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int __init zuma_display_commit_base(phys_addr_t base,
+					   u32 *frame_before,
+					   u32 *frame_after)
+{
+	int ret;
+
+	if (upper_32_bits(base))
+		return -ERANGE;
+
+	ret = zuma_display_wait_idle();
+	if (ret)
+		return ret;
+
+	writel(lower_32_bits(base),
+	       zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0);
+	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0) !=
+	    lower_32_bits(base))
+		return -EIO;
+
+	ret = zuma_display_request_active_window();
+	if (ret)
+		return ret;
+
+	ret = zuma_display_trigger_frame(frame_before, frame_after);
+	if (ret)
+		return ret;
+
+	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0) !=
+			lower_32_bits(base) ||
+	    readl(zuma_dpp0.base + ZUMA_DPP_RDMA_BASEADDR_P0 +
+		  ZUMA_DPP_RDMA_SHADOW_OFFSET) != lower_32_bits(base))
+		return -EIO;
+
+	return 0;
+}
+
+static bool __init zuma_display_flip_to_reserved(void)
+{
+	phys_addr_t new_base = zuma_husky_flip_framebuffer_base;
+	void *source, *destination;
+	u32 frame_before = 0, frame_after = 0;
+	u32 rollback_before = 0, rollback_after = 0;
+	int rollback_ret;
+	int ret;
+
+	if (!zuma_display_update_ready()) {
+		pr_err("zuma-display-handoff: base flip refused by inherited state\n");
+		return false;
+	}
+
+	if (!zuma_flip_buffer_valid())
+		return false;
+
+	source = memremap(ZUMA_HANDOFF_FB_BASE, ZUMA_HANDOFF_FB_SIZE,
+			  MEMREMAP_WB);
+	if (!source) {
+		pr_err("zuma-display-handoff: base flip source mapping failed\n");
+		return false;
+	}
+
+	destination = memremap(new_base, ZUMA_HANDOFF_FB_SIZE, MEMREMAP_WB);
+	if (!destination) {
+		pr_err("zuma-display-handoff: base flip destination mapping failed\n");
+		memunmap(source);
+		return false;
+	}
+
+	memcpy(destination, source, ZUMA_HANDOFF_FB_SIZE);
+	if (memcmp(destination, source, ZUMA_HANDOFF_FB_SIZE)) {
+		pr_err("zuma-display-handoff: base flip copy verification failed\n");
+		memunmap(destination);
+		memunmap(source);
+		return false;
+	}
+	arch_sync_dma_for_device(new_base, ZUMA_HANDOFF_FB_SIZE, DMA_TO_DEVICE);
+	arch_sync_dma_flush();
+	memunmap(destination);
+	memunmap(source);
+
+	ret = zuma_display_commit_base(new_base, &frame_before, &frame_after);
+	if (!ret) {
+		zuma_framebuffer_phys = new_base;
+		if (zuma_display_update_ready()) {
+			pr_info("zuma-display-handoff: DPP0 base flip %#x->%pa frame=%#x->%#x, BGRA format unchanged\n",
+				ZUMA_HANDOFF_FB_BASE, &new_base,
+				frame_before, frame_after);
+			return true;
+		}
+		ret = -EIO;
+	}
+
+	pr_err("zuma-display-handoff: DPP0 base flip failed: %d; attempting rollback\n",
+	       ret);
+	rollback_ret = zuma_display_commit_base(ZUMA_HANDOFF_FB_BASE,
+						&rollback_before,
+						&rollback_after);
+	zuma_framebuffer_phys = ZUMA_HANDOFF_FB_BASE;
+	if (rollback_ret || !zuma_display_update_ready()) {
+		pr_crit("zuma-display-handoff: DPP0 base rollback failed: %d\n",
+			rollback_ret ?: -EIO);
+		return false;
+	}
+
+	pr_info("zuma-display-handoff: DPP0 base rollback completed frame=%#x->%#x\n",
+		rollback_before, rollback_after);
+	return false;
 }
 
 static void zuma_fb_mark_dirty(struct zuma_framebuffer *par,
@@ -544,7 +811,6 @@ static int zuma_fb_submit_update(struct fb_info *info)
 	unsigned long flags;
 	size_t start, end;
 	u32 frame_before, frame_after;
-	bool trigger_unmasked = false;
 	int ret = 0;
 
 	mutex_lock(&zuma_display_mmio_lock);
@@ -564,35 +830,21 @@ static int zuma_fb_submit_update(struct fb_info *info)
 		goto out_requeue;
 	}
 
-	arch_sync_dma_for_device(ZUMA_HANDOFF_FB_BASE + start, end - start,
+	arch_sync_dma_for_device(zuma_framebuffer_phys + start, end - start,
 				 DMA_TO_DEVICE);
 	arch_sync_dma_flush();
 
-	frame_before = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
-	frame_after = frame_before;
-	zuma_display_set_hw_trigger(true);
-	trigger_unmasked = true;
-	ret = readl_poll_timeout_atomic(zuma_decon0.base +
-			ZUMA_DECON_FRAME_COUNT, frame_after,
-			frame_after != frame_before, 1, 50000);
-	zuma_display_set_hw_trigger(false);
-	trigger_unmasked = false;
+	ret = zuma_display_request_active_window();
 	if (ret) {
-		pr_err_ratelimited("zuma-display-handoff: framebuffer update timed out at frame %#x\n",
-				   frame_after);
+		pr_err_ratelimited("zuma-display-handoff: framebuffer window update request failed: %d\n",
+				   ret);
 		goto out_requeue;
 	}
 
-	ret = zuma_display_wait_idle();
+	ret = zuma_display_trigger_frame(&frame_before, &frame_after);
 	if (ret) {
-		pr_err_ratelimited("zuma-display-handoff: framebuffer pipeline did not become idle\n");
-		goto out_requeue;
-	}
-
-	if (readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) !=
-	    ZUMA_DECON_TRIG_EXPECTED) {
-		ret = -EIO;
-		pr_err_ratelimited("zuma-display-handoff: framebuffer trigger did not return masked\n");
+		pr_err_ratelimited("zuma-display-handoff: framebuffer update did not complete: %d, frame=%#x\n",
+				   ret, frame_after);
 		goto out_requeue;
 	}
 
@@ -604,8 +856,6 @@ static int zuma_fb_submit_update(struct fb_info *info)
 	goto out_unlock;
 
 out_requeue:
-	if (trigger_unmasked)
-		zuma_display_set_hw_trigger(false);
 	zuma_fb_mark_dirty(par, start, end - start);
 out_unlock:
 	mutex_unlock(&zuma_display_mmio_lock);
@@ -826,10 +1076,14 @@ static int __init zuma_display_handoff_init(void)
 		pr_warn("zuma-display-handoff: flip framebuffer reservation unavailable\n");
 	mutex_lock(&zuma_display_mmio_lock);
 	zuma_display_snapshot("early");
-	if (zuma_husky_boot_framebuffer_reserved)
+	if (zuma_husky_boot_framebuffer_reserved) {
 		zuma_framebuffer_validated = zuma_display_scan_framebuffer();
-	else
+		if (zuma_framebuffer_validated)
+			zuma_framebuffer_validated =
+				zuma_display_flip_to_reserved();
+	} else {
 		pr_crit("zuma-display-handoff: framebuffer reservation unavailable; scan skipped\n");
+	}
 	mutex_unlock(&zuma_display_mmio_lock);
 	schedule_delayed_work(&zuma_display_snapshot_work,
 			      msecs_to_jiffies(zuma_snapshot_intervals_ms[0]));
@@ -860,8 +1114,8 @@ static int __init zuma_framebuffer_init(void)
 	}
 	mutex_unlock(&zuma_display_mmio_lock);
 
-	screen_buffer = memremap(ZUMA_HANDOFF_FB_BASE, ZUMA_HANDOFF_FB_SIZE,
-				 MEMREMAP_WB);
+	screen_buffer = memremap(zuma_framebuffer_phys,
+				 ZUMA_HANDOFF_FB_SIZE, MEMREMAP_WB);
 	if (!screen_buffer) {
 		pr_err("zuma-display-handoff: framebuffer mapping failed\n");
 		return 0;
@@ -879,7 +1133,7 @@ static int __init zuma_framebuffer_init(void)
 	par->dirty_start = ZUMA_HANDOFF_FB_SIZE;
 
 	strscpy(info->fix.id, "zuma-handoff", sizeof(info->fix.id));
-	info->fix.smem_start = ZUMA_HANDOFF_FB_BASE;
+	info->fix.smem_start = zuma_framebuffer_phys;
 	info->fix.smem_len = ZUMA_HANDOFF_FB_SIZE;
 	info->fix.type = FB_TYPE_PACKED_PIXELS;
 	info->fix.visual = FB_VISUAL_TRUECOLOR;
@@ -923,8 +1177,8 @@ static int __init zuma_framebuffer_init(void)
 	if (ret)
 		goto out_defio;
 
-	pr_info("zuma-display-handoff: fb%d registered at %#x, %ux%u BGRA8888, stride=%zu\n",
-		info->node, ZUMA_HANDOFF_FB_BASE, ZUMA_HANDOFF_FB_WIDTH,
+	pr_info("zuma-display-handoff: fb%d registered at %pa, %ux%u BGRA8888, stride=%zu\n",
+		info->node, &zuma_framebuffer_phys, ZUMA_HANDOFF_FB_WIDTH,
 		ZUMA_HANDOFF_FB_HEIGHT, (size_t)ZUMA_HANDOFF_FB_STRIDE);
 	return 0;
 
