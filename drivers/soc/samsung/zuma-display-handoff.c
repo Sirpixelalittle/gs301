@@ -15,6 +15,7 @@
 #include <linux/dma-direction.h>
 #include <linux/dma-map-ops.h>
 #include <linux/device.h>
+#include <linux/dma-fence.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -43,6 +44,7 @@
 #include <drm/drm_encoder.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_file.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -423,7 +425,7 @@ static void
 zuma_drm_primary_plane_atomic_update(struct drm_plane *plane,
 				     struct drm_atomic_commit *state)
 {
-	/* The fallible copy and trigger completed before the state swap. */
+	/* The driver commit path owns the fallible copy and frame trigger. */
 }
 
 static enum drm_mode_status
@@ -446,6 +448,8 @@ static int zuma_drm_crtc_atomic_check(struct drm_crtc *crtc,
 	old_crtc_state = drm_atomic_get_old_crtc_state(state, crtc);
 	new_crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	new_crtc_state->no_vblank = false;
+	if (new_crtc_state->async_flip)
+		return -EOPNOTSUPP;
 
 	if (!new_crtc_state->enable) {
 		if (old_crtc_state->enable || new_crtc_state->active)
@@ -775,7 +779,7 @@ static int zuma_drm_register(void)
 		goto err_unregister_root;
 
 	zuma_drm_device = zdev;
-	pr_info("zuma-display-handoff: registered DRM-only fixed-mode shadow updates with guarded hardware vblank proof; blocking commits only\n");
+	pr_info("zuma-display-handoff: registered DRM-only fixed-mode shadow updates with guarded hardware vblank proof and workqueue-backed nonblocking flips\n");
 	return 0;
 
 err_unregister_root:
@@ -1525,7 +1529,7 @@ static int zuma_drm_restore_boot_buffer(struct zuma_drm *zdev)
 	if (memcmp(zuma_scanout_buffer, zuma_boot_buffer,
 		   ZUMA_HANDOFF_FB_SIZE)) {
 		ret = -EIO;
-		zuma_drm_update_failed = true;
+		WRITE_ONCE(zuma_drm_update_failed, true);
 		pr_err("zuma-display-handoff: DRM boot restore copy failed closed\n");
 		goto out_unlock;
 	}
@@ -1537,7 +1541,7 @@ out_unlock:
 	return ret;
 }
 
-static void zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
+static int zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 {
 	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
 	struct drm_crtc_state *new_crtc_state;
@@ -1545,7 +1549,6 @@ static void zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 	unsigned long flags;
 	u64 sequence;
 	u32 int_en;
-	bool event_sent = false;
 	bool failed = false;
 
 	new_crtc_state = drm_atomic_get_new_crtc_state(state, &zdev->crtc);
@@ -1553,17 +1556,6 @@ static void zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 		failed = true;
 
 	sequence = drm_crtc_vblank_count(&zdev->crtc);
-	spin_lock_irqsave(&state->dev->event_lock, flags);
-	event = new_crtc_state ? new_crtc_state->event : NULL;
-	if (WARN_ON(!event)) {
-		failed = true;
-	} else {
-		drm_crtc_send_vblank_event(&zdev->crtc, event);
-		new_crtc_state->event = NULL;
-		event_sent = true;
-	}
-	spin_unlock_irqrestore(&state->dev->event_lock, flags);
-
 	drm_crtc_vblank_put(&zdev->crtc);
 	synchronize_irq(zdev->frame_start_irq);
 	synchronize_irq(zdev->frame_done_irq);
@@ -1573,28 +1565,108 @@ static void zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 	if (int_en != ZUMA_DECON_INT_QUIESCENT &&
 	    int_en != ZUMA_DECON_INT_ACTIVE)
 		failed = true;
-	if (failed) {
-		WRITE_ONCE(zuma_drm_update_failed, true);
-		pr_err("zuma-display-handoff: DRM vblank event completion failed closed\n");
-	} else if (event_sent && zuma_drm_update_count <= 8) {
+	if (READ_ONCE(zuma_drm_update_failed))
+		failed = true;
+	if (failed)
+		goto out_failed;
+
+	spin_lock_irqsave(&state->dev->event_lock, flags);
+	event = new_crtc_state->event;
+	if (WARN_ON(!event)) {
+		spin_unlock_irqrestore(&state->dev->event_lock, flags);
+		goto out_failed;
+	}
+	drm_crtc_send_vblank_event(&zdev->crtc, event);
+	new_crtc_state->event = NULL;
+	spin_unlock_irqrestore(&state->dev->event_lock, flags);
+
+	if (zuma_drm_update_count <= 8)
 		pr_info("zuma-display-handoff: DRM real vblank event %llu sequence=%llu int-en=%#x\n",
 			(unsigned long long)zuma_drm_update_count,
 			(unsigned long long)sequence, int_en);
-	}
+	return 0;
+
+out_failed:
+	WRITE_ONCE(zuma_drm_update_failed, true);
+	pr_err("zuma-display-handoff: DRM vblank event completion failed closed\n");
+	return -EIO;
 }
 
-static void zuma_drm_commit_tail(struct drm_atomic_commit *state)
+static void zuma_drm_cancel_vblank_event(struct drm_atomic_commit *state,
+					 int error)
+{
+	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_pending_vblank_event *event = NULL;
+	struct completion *completion;
+	void (*completion_release)(struct completion *completion);
+	unsigned long flags;
+
+	if (WARN_ON(error >= 0))
+		error = -EIO;
+	new_crtc_state = drm_atomic_get_new_crtc_state(state, &zdev->crtc);
+	spin_lock_irqsave(&state->dev->event_lock, flags);
+	if (new_crtc_state) {
+		event = new_crtc_state->event;
+		new_crtc_state->event = NULL;
+	}
+	if (event && event->base.fence) {
+		dma_fence_set_error(event->base.fence, error);
+		dma_fence_signal(event->base.fence);
+	}
+	if (event && event->base.completion) {
+		completion = event->base.completion;
+		completion_release = event->base.completion_release;
+		event->base.completion = NULL;
+		event->base.completion_release = NULL;
+		complete_all(completion);
+		if (completion_release)
+			completion_release(completion);
+	}
+	spin_unlock_irqrestore(&state->dev->event_lock, flags);
+
+	if (event)
+		drm_event_cancel_free(state->dev, &event->base);
+	else
+		WARN_ON(1);
+}
+
+static void zuma_drm_commit_tail(struct drm_atomic_commit *state,
+				 int scanout_ret)
 {
 	struct drm_device *drm = state->dev;
 
 	drm_atomic_helper_commit_modeset_disables(drm, state);
 	drm_atomic_helper_commit_planes(drm, state, 0);
 	drm_atomic_helper_commit_modeset_enables(drm, state);
-	zuma_drm_complete_vblank_event(state);
+	if (!scanout_ret)
+		scanout_ret = zuma_drm_complete_vblank_event(state);
+	if (scanout_ret)
+		zuma_drm_cancel_vblank_event(state, scanout_ret);
 	drm_atomic_helper_commit_hw_done(state);
 	drm_atomic_helper_wait_for_flip_done(drm, state);
 	drm_atomic_helper_cleanup_planes(drm, state);
 	drm_atomic_helper_commit_cleanup_done(state);
+}
+
+static void zuma_drm_commit_work(struct work_struct *work)
+{
+	struct drm_atomic_commit *state =
+		container_of(work, struct drm_atomic_commit, commit_work);
+	int ret;
+
+	ret = drm_atomic_helper_wait_for_fences(state->dev, state, false);
+	drm_atomic_helper_wait_for_dependencies(state);
+	if (!ret)
+		ret = zuma_drm_commit_shadow(state);
+	if (ret) {
+		WRITE_ONCE(zuma_drm_update_failed, true);
+		pr_err("zuma-display-handoff: asynchronous DRM update failed closed: %d; "
+		       "flip event cancelled\n", ret);
+	}
+
+	zuma_drm_commit_tail(state, ret);
+	drm_atomic_commit_put(state);
 }
 
 static int zuma_drm_atomic_commit(struct drm_device *drm,
@@ -1604,12 +1676,10 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 	struct zuma_drm *zdev = container_of(drm, struct zuma_drm, drm);
 	struct drm_plane_state *old_plane_state;
 	struct drm_plane_state *new_plane_state;
+	struct drm_crtc_state *new_crtc_state;
 	bool restore_boot;
 	bool update_scanout;
 	int ret;
-
-	if (nonblock)
-		return -EOPNOTSUPP;
 
 	old_plane_state =
 		drm_atomic_get_old_plane_state(state, &zdev->primary_plane);
@@ -1622,14 +1692,42 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 		 new_plane_state->fb);
 	if (!update_scanout)
 		return -EOPNOTSUPP;
+	if (READ_ONCE(zuma_drm_update_failed))
+		return -EIO;
 
-	ret = drm_atomic_helper_setup_commit(state, false);
+	new_crtc_state =
+		drm_atomic_get_new_crtc_state(state, &zdev->crtc);
+	if (nonblock &&
+	    (!old_plane_state || !old_plane_state->crtc ||
+	     !old_plane_state->fb || restore_boot || !new_plane_state ||
+	     !new_plane_state->crtc || !new_plane_state->fb ||
+	     !new_crtc_state || drm_atomic_crtc_needs_modeset(new_crtc_state)))
+		return -EOPNOTSUPP;
+
+	ret = drm_atomic_helper_setup_commit(state, nonblock);
 	if (ret)
 		return ret;
+
+	if (nonblock)
+		INIT_WORK(&state->commit_work, zuma_drm_commit_work);
 
 	ret = drm_atomic_helper_prepare_planes(drm, state);
 	if (ret)
 		return ret;
+
+	if (nonblock) {
+		if (READ_ONCE(zuma_drm_update_failed)) {
+			ret = -EIO;
+			goto out_unprepare;
+		}
+		ret = drm_atomic_helper_swap_state(state, true);
+		if (ret)
+			goto out_unprepare;
+
+		drm_atomic_commit_get(state);
+		queue_work(system_dfl_wq, &state->commit_work);
+		return 0;
+	}
 
 	ret = drm_atomic_helper_wait_for_fences(drm, state, true);
 	if (ret)
@@ -1653,7 +1751,7 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 	}
 
 	drm_atomic_commit_get(state);
-	zuma_drm_commit_tail(state);
+	zuma_drm_commit_tail(state, 0);
 	drm_atomic_commit_put(state);
 	return 0;
 
