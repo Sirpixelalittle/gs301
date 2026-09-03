@@ -31,6 +31,7 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/printk.h>
+#include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/soc/samsung/zuma-display-handoff.h>
 #include <linux/workqueue.h>
@@ -191,17 +192,14 @@
 #define ZUMA_DPP_RDMA_CONFIG_ERR_STATUS 0x0740
 #define ZUMA_DPP_RDMA_INHERITED_IRQ     ZUMA_DPP_RDMA_FRAME_DONE_IRQ
 #define ZUMA_DPP_RDMA_MASKED_CONTROL    ZUMA_DPP_RDMA_ALL_IRQ_MASK
-#define ZUMA_DPP_RDMA_FRAME_CONTROL     \
-	(ZUMA_DPP_RDMA_ALL_IRQ_MASK & ~ZUMA_DPP_RDMA_FRAME_DONE_MASK)
-#define ZUMA_DPP_RDMA_PROOF_CONTROL     \
-	(ZUMA_DPP_RDMA_FRAME_CONTROL | ZUMA_DPP_RDMA_IRQ_ENABLE)
+#define ZUMA_DPP_RDMA_OWNED_CONTROL     ZUMA_DPP_RDMA_IRQ_ENABLE
 #define ZUMA_DPP_CORE_IRQ_ENABLE        BIT(0)
 #define ZUMA_DPP_CORE_FRAME_DONE_IRQ    BIT(0)
 #define ZUMA_DPP_CORE_CONFIG_ERR_IRQ    BIT(1)
 #define ZUMA_DPP_CORE_ALL_IRQ_STATUS    0x3
 #define ZUMA_DPP_CORE_INHERITED_MASK    0x4
 #define ZUMA_DPP_CORE_MASKED_MASK       0x7
-#define ZUMA_DPP_CORE_PROOF_MASK        0x6
+#define ZUMA_DPP_CORE_OWNED_MASK        ZUMA_DPP_CORE_INHERITED_MASK
 #define ZUMA_DPP_FORMAT_SHIFT           8
 #define ZUMA_DPP_FORMAT_MASK            0x3f
 #define ZUMA_DPP_FORMAT_FIELD_MASK      \
@@ -268,8 +266,16 @@ enum zuma_dpp0_replay_region {
 enum zuma_dpp0_replay_stage {
 	ZUMA_DPP0_REPLAY_IDMA_INIT,
 	ZUMA_DPP0_REPLAY_FIXED_CONFIG,
-	ZUMA_DPP0_REPLAY_IRQ_PROOF,
+	ZUMA_DPP0_REPLAY_IRQ_TAKEOVER,
 	ZUMA_DPP0_REPLAY_DONE,
+};
+
+enum zuma_dpp0_irq_owner_state {
+	ZUMA_DPP0_IRQ_INHERITED,
+	ZUMA_DPP0_IRQ_ACQUIRING,
+	ZUMA_DPP0_IRQ_OWNED,
+	ZUMA_DPP0_IRQ_RELEASING,
+	ZUMA_DPP0_IRQ_BROKEN,
 };
 
 struct zuma_dpp0_replay_write {
@@ -298,21 +304,30 @@ struct zuma_drm {
 	atomic64_t dpp_dma_irq_count;
 	atomic64_t dpp_core_irq_count;
 	atomic_t irq_error;
+	atomic_t dpp_dma_error_status;
+	atomic_t dpp_core_error_status;
 	int frame_start_irq;
 	int frame_done_irq;
 	int dpp_dma_irq;
 	int dpp_core_irq;
 	u32 dpp_dma_status;
+	u32 dpp_dma_control;
 	u32 dpp_core_status;
+	u32 dpp_core_control;
+	u32 dpp_core_mask;
 	u32 dpp_dma_config_error;
 	u32 dpp_core_config_error;
 	bool irq_proof_armed;
 	bool irq_routes_enabled;
 	bool irq_proven_once;
 	bool dpp_irq_routes_enabled;
-	bool dpp_irq_mmio_touched;
-	bool dpp_irq_restored;
 	enum zuma_dpp0_replay_stage replay_stage;
+	enum zuma_dpp0_irq_owner_state dpp_irq_owner_state;
+	struct workqueue_struct *workqueue;
+	struct work_struct dpp_irq_fault_work;
+	/* Serializes nonblocking queue admission with reboot shutdown. */
+	struct mutex commit_admission_lock;
+	struct notifier_block reboot_notifier;
 };
 
 struct zuma_drm_irq_proof {
@@ -327,6 +342,7 @@ struct zuma_drm_irq_proof {
 	u64 dpp_dma_after;
 	u64 dpp_core_after;
 	bool dpp_irq_active;
+	bool dpp_irq_released;
 };
 
 static DEFINE_MUTEX(zuma_display_mmio_lock);
@@ -854,6 +870,10 @@ static const struct drm_connector_funcs zuma_drm_connector_funcs = {
 static int zuma_drm_atomic_commit(struct drm_device *drm,
 				  struct drm_atomic_commit *state,
 				  bool nonblock);
+static void zuma_display_set_hw_trigger(bool unmask);
+static void zuma_drm_dpp_irq_fault_work(struct work_struct *work);
+static int zuma_drm_reboot_notifier(struct notifier_block *notifier,
+				    unsigned long action, void *data);
 
 static const struct drm_mode_config_funcs zuma_drm_mode_config_funcs = {
 	.fb_create = drm_gem_fb_create_with_dirty,
@@ -885,6 +905,43 @@ static void zuma_drm_set_irq_proof_armed(struct zuma_drm *zdev, bool armed)
 	smp_store_release(&zdev->irq_proof_armed, armed);
 }
 
+static enum zuma_dpp0_irq_owner_state
+zuma_dpp0_irq_owner_state(struct zuma_drm *zdev)
+{
+	/* Pair with state publication before Linux IRQ route enable. */
+	return smp_load_acquire(&zdev->dpp_irq_owner_state);
+}
+
+static void
+zuma_dpp0_set_irq_owner_state(struct zuma_drm *zdev,
+			      enum zuma_dpp0_irq_owner_state state)
+{
+	/* Keep handlers live until both Linux routes are synchronized. */
+	smp_store_release(&zdev->dpp_irq_owner_state, state);
+}
+
+static bool zuma_dpp0_irq_handler_live(struct zuma_drm *zdev)
+{
+	enum zuma_dpp0_irq_owner_state state =
+		zuma_dpp0_irq_owner_state(zdev);
+
+	return state == ZUMA_DPP0_IRQ_ACQUIRING ||
+	       state == ZUMA_DPP0_IRQ_OWNED ||
+	       state == ZUMA_DPP0_IRQ_RELEASING;
+}
+
+static void zuma_drm_latch_irq_fault(struct zuma_drm *zdev)
+{
+	atomic_set(&zdev->irq_error, 1);
+	WRITE_ONCE(zuma_drm_update_failed, true);
+	complete(&zdev->frame_start_completion);
+	complete(&zdev->frame_done_completion);
+	complete(&zdev->dpp_dma_completion);
+	complete(&zdev->dpp_core_completion);
+	if (zdev->workqueue)
+		queue_work(zdev->workqueue, &zdev->dpp_irq_fault_work);
+}
+
 static irqreturn_t
 zuma_drm_handle_frame_irq(struct zuma_drm *zdev, u32 mask,
 			  atomic64_t *counter, struct completion *completion,
@@ -896,21 +953,22 @@ zuma_drm_handle_frame_irq(struct zuma_drm *zdev, u32 mask,
 	proof_armed = zuma_drm_irq_proof_is_armed(zdev);
 	pending = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND);
 	if (!(pending & mask)) {
-		if (proof_armed)
-			atomic_set(&zdev->irq_error, 1);
+		if (proof_armed || zdev->irq_routes_enabled)
+			zuma_drm_latch_irq_fault(zdev);
 		return IRQ_NONE;
 	}
 
 	writel(mask, zuma_decon0.base + ZUMA_DECON_INT_PEND);
 	if (readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) & mask) {
-		atomic_set(&zdev->irq_error, 1);
+		zuma_drm_latch_irq_fault(zdev);
 		return IRQ_HANDLED;
 	}
 
 	atomic64_inc(counter);
-	if (account_vblank && !drm_crtc_handle_vblank(&zdev->crtc) &&
-	    proof_armed)
-		atomic_set(&zdev->irq_error, 1);
+	if (!proof_armed)
+		zuma_drm_latch_irq_fault(zdev);
+	if (account_vblank && !drm_crtc_handle_vblank(&zdev->crtc))
+		zuma_drm_latch_irq_fault(zdev);
 	if (proof_armed)
 		complete(completion);
 	return IRQ_HANDLED;
@@ -938,34 +996,43 @@ static irqreturn_t zuma_drm_dpp_dma_irq(int irq, void *data)
 {
 	struct zuma_drm *zdev = data;
 	bool proof_armed = zuma_drm_irq_proof_is_armed(zdev);
+	bool live = zuma_dpp0_irq_handler_live(zdev);
 	u32 control;
 	u32 status;
 	u32 value;
+	bool bad = false;
 
 	value = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
 	control = value & ZUMA_DPP_RDMA_CONTROL_MASK;
 	status = value & ZUMA_DPP_RDMA_ALL_IRQ_STATUS;
-	zdev->dpp_dma_status = status;
+	WRITE_ONCE(zdev->dpp_dma_control, control);
+	WRITE_ONCE(zdev->dpp_dma_status, status);
 	if (value & ~(ZUMA_DPP_RDMA_ALL_IRQ_STATUS |
 		      ZUMA_DPP_RDMA_CONTROL_MASK))
-		atomic_set(&zdev->irq_error, 1);
+		bad = true;
 	if (status & ZUMA_DPP_RDMA_CONFIG_ERR_IRQ)
-		zdev->dpp_dma_config_error =
-			readl(zuma_dpp0.base +
-			      ZUMA_DPP_RDMA_CONFIG_ERR_STATUS);
+		WRITE_ONCE(zdev->dpp_dma_config_error,
+			   readl(zuma_dpp0.base +
+				 ZUMA_DPP_RDMA_CONFIG_ERR_STATUS));
 	if (status)
-		writel(control | status,
+		writel((live ? ZUMA_DPP_RDMA_OWNED_CONTROL : 0) | status,
 		       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
-	if (!status || control != ZUMA_DPP_RDMA_PROOF_CONTROL ||
-	    (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) &
-	     (ZUMA_DPP_RDMA_ALL_IRQ_STATUS |
-	      ZUMA_DPP_RDMA_CONTROL_MASK)) != control)
-		atomic_set(&zdev->irq_error, 1);
-	if (proof_armed && status == ZUMA_DPP_RDMA_FRAME_DONE_IRQ) {
+	if (!status || !live || control != ZUMA_DPP_RDMA_OWNED_CONTROL ||
+	    readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) !=
+		ZUMA_DPP_RDMA_OWNED_CONTROL)
+		bad = true;
+	if (status & ZUMA_DPP_RDMA_FRAME_DONE_IRQ) {
 		atomic64_inc(&zdev->dpp_dma_irq_count);
-		complete(&zdev->dpp_dma_completion);
-	} else if (status != ZUMA_DPP_RDMA_FRAME_DONE_IRQ) {
-		atomic_set(&zdev->irq_error, 1);
+		if (proof_armed)
+			complete(&zdev->dpp_dma_completion);
+		else
+			bad = true;
+	}
+	if (status & ~ZUMA_DPP_RDMA_FRAME_DONE_IRQ)
+		bad = true;
+	if (bad) {
+		atomic_or(status, &zdev->dpp_dma_error_status);
+		zuma_drm_latch_irq_fault(zdev);
 	}
 
 	return status ? IRQ_HANDLED : IRQ_NONE;
@@ -975,29 +1042,41 @@ static irqreturn_t zuma_drm_dpp_core_irq(int irq, void *data)
 {
 	struct zuma_drm *zdev = data;
 	bool proof_armed = zuma_drm_irq_proof_is_armed(zdev);
+	bool live = zuma_dpp0_irq_handler_live(zdev);
+	u32 control;
+	u32 mask;
 	u32 status;
+	bool bad = false;
 
+	control = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON);
+	mask = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
 	status = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS);
-	zdev->dpp_core_status = status;
+	WRITE_ONCE(zdev->dpp_core_control, control);
+	WRITE_ONCE(zdev->dpp_core_mask, mask);
+	WRITE_ONCE(zdev->dpp_core_status, status);
 	if (status & ZUMA_DPP_CORE_CONFIG_ERR_IRQ)
-		zdev->dpp_core_config_error =
-			readl(zuma_dpp0_dpp.base +
-			      ZUMA_DPP_CORE_CONFIG_ERROR);
+		WRITE_ONCE(zdev->dpp_core_config_error,
+			   readl(zuma_dpp0_dpp.base +
+				 ZUMA_DPP_CORE_CONFIG_ERROR));
 	if (status & ZUMA_DPP_CORE_ALL_IRQ_STATUS)
 		writel(status & ZUMA_DPP_CORE_ALL_IRQ_STATUS,
 		       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS);
-	if (!status ||
-	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS) ||
-	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON) !=
-		ZUMA_DPP_CORE_IRQ_ENABLE ||
-	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK) !=
-		ZUMA_DPP_CORE_PROOF_MASK)
-		atomic_set(&zdev->irq_error, 1);
-	if (proof_armed && status == ZUMA_DPP_CORE_FRAME_DONE_IRQ) {
+	if (!status || !live || control != ZUMA_DPP_CORE_IRQ_ENABLE ||
+	    mask != ZUMA_DPP_CORE_OWNED_MASK ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS))
+		bad = true;
+	if (status & ZUMA_DPP_CORE_FRAME_DONE_IRQ) {
 		atomic64_inc(&zdev->dpp_core_irq_count);
-		complete(&zdev->dpp_core_completion);
-	} else if (status != ZUMA_DPP_CORE_FRAME_DONE_IRQ) {
-		atomic_set(&zdev->irq_error, 1);
+		if (proof_armed)
+			complete(&zdev->dpp_core_completion);
+		else
+			bad = true;
+	}
+	if (status & ~ZUMA_DPP_CORE_FRAME_DONE_IRQ)
+		bad = true;
+	if (bad) {
+		atomic_or(status, &zdev->dpp_core_error_status);
+		zuma_drm_latch_irq_fault(zdev);
 	}
 
 	return status ? IRQ_HANDLED : IRQ_NONE;
@@ -1047,6 +1126,10 @@ static int zuma_drm_setup_irqs(struct zuma_drm *zdev)
 	atomic64_set(&zdev->dpp_dma_irq_count, 0);
 	atomic64_set(&zdev->dpp_core_irq_count, 0);
 	atomic_set(&zdev->irq_error, 0);
+	atomic_set(&zdev->dpp_dma_error_status, 0);
+	atomic_set(&zdev->dpp_core_error_status, 0);
+	INIT_WORK(&zdev->dpp_irq_fault_work, zuma_drm_dpp_irq_fault_work);
+	zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_INHERITED);
 	zdev->frame_start_irq = -1;
 	zdev->frame_done_irq = -1;
 	zdev->dpp_dma_irq = -1;
@@ -1108,9 +1191,14 @@ static int zuma_drm_setup_irqs(struct zuma_drm *zdev)
 
 	pr_info("zuma-display-handoff: requested disabled DECON frame IRQs start=%d done=%d\n",
 		zdev->frame_start_irq, zdev->frame_done_irq);
-	pr_info("zuma-display-handoff: requested disabled DPP0 proof IRQs dma=%d dpp=%d\n",
+	pr_info("zuma-display-handoff: requested disabled DPP0 IRQs dma=%d dpp=%d\n",
 		zdev->dpp_dma_irq, zdev->dpp_core_irq);
 	return 0;
+}
+
+static void zuma_drm_destroy_workqueue(void *data)
+{
+	destroy_workqueue(data);
 }
 
 static int zuma_drm_register(void)
@@ -1139,6 +1227,18 @@ static int zuma_drm_register(void)
 		ret = PTR_ERR(zdev);
 		goto err_unregister_root;
 	}
+	mutex_init(&zdev->commit_admission_lock);
+	zdev->workqueue =
+		alloc_ordered_workqueue("zuma-display-handoff", WQ_MEM_RECLAIM);
+	if (!zdev->workqueue) {
+		ret = -ENOMEM;
+		goto err_unregister_root;
+	}
+	ret = devm_add_action_or_reset(zuma_drm_root,
+				       zuma_drm_destroy_workqueue,
+				       zdev->workqueue);
+	if (ret)
+		goto err_unregister_root;
 
 	drm = &zdev->drm;
 	ret = drmm_mode_config_init(drm);
@@ -1200,9 +1300,18 @@ static int zuma_drm_register(void)
 	ret = zuma_drm_setup_irqs(zdev);
 	if (ret)
 		goto err_unregister_root;
+	zdev->reboot_notifier.notifier_call = zuma_drm_reboot_notifier;
+	ret = devm_register_reboot_notifier(zuma_drm_root,
+					    &zdev->reboot_notifier);
+	if (ret)
+		goto err_unregister_root;
 	ret = zuma_drm_enable_irq_routes(zdev);
 	if (ret)
 		goto err_unregister_root;
+	if (READ_ONCE(zuma_drm_update_failed)) {
+		ret = -EIO;
+		goto err_disable_irq_routes;
+	}
 
 	drm_mode_config_reset(drm);
 	drm_crtc_vblank_on_config(&zdev->crtc, &vblank_config);
@@ -1210,12 +1319,18 @@ static int zuma_drm_register(void)
 
 	ret = drm_dev_register(drm, 0);
 	if (ret)
-		goto err_unregister_root;
+		goto err_disable_irq_routes;
 
 	zuma_drm_device = zdev;
-	pr_info("zuma-display-handoff: registered DRM-only fixed-mode shadow updates with guarded hardware vblank proof and workqueue-backed nonblocking flips\n");
+	pr_info("zuma-display-handoff: registered DRM-only fixed-mode shadow updates with persistent DPP IRQ lifecycle and ordered nonblocking flips\n");
 	return 0;
 
+err_disable_irq_routes:
+	disable_irq_nosync(zdev->frame_done_irq);
+	disable_irq_nosync(zdev->frame_start_irq);
+	zdev->irq_routes_enabled = false;
+	synchronize_irq(zdev->frame_done_irq);
+	synchronize_irq(zdev->frame_start_irq);
 err_unregister_root:
 	root_device_unregister(zuma_drm_root);
 	zuma_drm_root = NULL;
@@ -1660,8 +1775,8 @@ zuma_dpp0_replay_stage_name(enum zuma_dpp0_replay_stage stage)
 		return "idma-init";
 	case ZUMA_DPP0_REPLAY_FIXED_CONFIG:
 		return "fixed-config";
-	case ZUMA_DPP0_REPLAY_IRQ_PROOF:
-		return "irq-proof";
+	case ZUMA_DPP0_REPLAY_IRQ_TAKEOVER:
+		return "irq-takeover";
 	case ZUMA_DPP0_REPLAY_DONE:
 		return "done";
 	}
@@ -1767,7 +1882,9 @@ zuma_dpp0_replay_final_state_ready(const struct zuma_dpp0_replay_write *writes,
 	return 0;
 }
 
-static int zuma_dpp0_irq_profile_ready(u32 rdma_irq)
+static int
+zuma_dpp0_irq_profile_ready(u32 rdma_irq, u32 dpp_irq_con,
+			    u32 dpp_irq_mask)
 {
 	lockdep_assert_held(&zuma_display_mmio_lock);
 
@@ -1783,17 +1900,59 @@ static int zuma_dpp0_irq_profile_ready(u32 rdma_irq)
 			ZUMA_DPP_RDMA_EXPECTED ||
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) != rdma_irq ||
 	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_SWRST) != 0 ||
-	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON) != 0 ||
+	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON) !=
+			dpp_irq_con ||
 	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK) !=
-			ZUMA_DPP_CORE_INHERITED_MASK ||
+			dpp_irq_mask ||
 	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS) != 0 ||
 	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_CONFIG_ERROR) != 0 ||
 	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_OP_STATUS) != 0 ?
 		-EIO : 0;
 }
 
+static int zuma_dpp0_irq_inherited_ready(void)
+{
+	if (!zuma_dpp0_irq_profile_ready(0, 0,
+					 ZUMA_DPP_CORE_INHERITED_MASK))
+		return 0;
+	return zuma_dpp0_irq_profile_ready(ZUMA_DPP_RDMA_INHERITED_IRQ, 0,
+					   ZUMA_DPP_CORE_INHERITED_MASK);
+}
+
+static int zuma_dpp0_irq_restored_ready(void)
+{
+	return zuma_dpp0_irq_profile_ready(0, 0,
+					   ZUMA_DPP_CORE_INHERITED_MASK);
+}
+
+static int zuma_dpp0_irq_owned_ready(void)
+{
+	return zuma_dpp0_irq_profile_ready(ZUMA_DPP_RDMA_OWNED_CONTROL,
+					   ZUMA_DPP_CORE_IRQ_ENABLE,
+					   ZUMA_DPP_CORE_OWNED_MASK);
+}
+
+static void
+zuma_dpp0_irq_prepare_frame(struct zuma_drm *zdev,
+			    struct zuma_drm_irq_proof *proof)
+{
+	reinit_completion(&zdev->dpp_dma_completion);
+	reinit_completion(&zdev->dpp_core_completion);
+	proof->dpp_dma_before = atomic64_read(&zdev->dpp_dma_irq_count);
+	proof->dpp_core_before = atomic64_read(&zdev->dpp_core_irq_count);
+	proof->dpp_irq_active = true;
+	WRITE_ONCE(zdev->dpp_dma_status, 0);
+	WRITE_ONCE(zdev->dpp_dma_control, 0);
+	WRITE_ONCE(zdev->dpp_core_status, 0);
+	WRITE_ONCE(zdev->dpp_core_control, 0);
+	WRITE_ONCE(zdev->dpp_core_mask, 0);
+	WRITE_ONCE(zdev->dpp_dma_config_error, 0);
+	WRITE_ONCE(zdev->dpp_core_config_error, 0);
+}
+
 static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 {
+	enum zuma_dpp0_irq_owner_state state;
 	u32 core_status;
 	u32 dma_enable;
 	u32 dma_status;
@@ -1802,8 +1961,12 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 	int ret = 0;
 
 	lockdep_assert_held(&zuma_display_mmio_lock);
-	if (!zdev->dpp_irq_mmio_touched)
+	state = zuma_dpp0_irq_owner_state(zdev);
+	if (state == ZUMA_DPP0_IRQ_INHERITED)
 		return 0;
+	if (state == ZUMA_DPP0_IRQ_BROKEN)
+		return -EIO;
+	zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_RELEASING);
 
 	if (zdev->dpp_irq_routes_enabled) {
 		disable_irq_nosync(zdev->dpp_core_irq);
@@ -1820,11 +1983,13 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 		      ZUMA_DPP_RDMA_CONTROL_MASK))
 		ret = -EIO;
 	if (dma_status & ZUMA_DPP_RDMA_CONFIG_ERR_IRQ)
-		zdev->dpp_dma_config_error =
-			readl(zuma_dpp0.base +
-			      ZUMA_DPP_RDMA_CONFIG_ERR_STATUS);
-	if (dma_status)
+		WRITE_ONCE(zdev->dpp_dma_config_error,
+			   readl(zuma_dpp0.base +
+				 ZUMA_DPP_RDMA_CONFIG_ERR_STATUS));
+	if (dma_status) {
+		atomic_or(dma_status, &zdev->dpp_dma_error_status);
 		ret = -EIO;
+	}
 	writel(ZUMA_DPP_RDMA_MASKED_CONTROL | dma_enable | dma_status,
 	       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
 	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) !=
@@ -1834,11 +1999,13 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 	core_status = readl(zuma_dpp0_dpp.base +
 			    ZUMA_DPP_CORE_IRQ_STATUS);
 	if (core_status & ZUMA_DPP_CORE_CONFIG_ERR_IRQ)
-		zdev->dpp_core_config_error =
-			readl(zuma_dpp0_dpp.base +
-			      ZUMA_DPP_CORE_CONFIG_ERROR);
-	if (core_status)
+		WRITE_ONCE(zdev->dpp_core_config_error,
+			   readl(zuma_dpp0_dpp.base +
+				 ZUMA_DPP_CORE_CONFIG_ERROR));
+	if (core_status) {
+		atomic_or(core_status, &zdev->dpp_core_error_status);
 		ret = -EIO;
+	}
 	writel(ZUMA_DPP_CORE_MASKED_MASK,
 	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
 	if (core_status & ZUMA_DPP_CORE_ALL_IRQ_STATUS)
@@ -1860,10 +2027,11 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 	value = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
 	dma_status = value & ZUMA_DPP_RDMA_ALL_IRQ_STATUS;
 	if (dma_status & ZUMA_DPP_RDMA_CONFIG_ERR_IRQ)
-		zdev->dpp_dma_config_error =
-			readl(zuma_dpp0.base +
-			      ZUMA_DPP_RDMA_CONFIG_ERR_STATUS);
+		WRITE_ONCE(zdev->dpp_dma_config_error,
+			   readl(zuma_dpp0.base +
+				 ZUMA_DPP_RDMA_CONFIG_ERR_STATUS));
 	if (dma_status) {
+		atomic_or(dma_status, &zdev->dpp_dma_error_status);
 		ret = -EIO;
 		writel(ZUMA_DPP_RDMA_MASKED_CONTROL | dma_status,
 		       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
@@ -1871,10 +2039,11 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 	core_status = readl(zuma_dpp0_dpp.base +
 			    ZUMA_DPP_CORE_IRQ_STATUS);
 	if (core_status & ZUMA_DPP_CORE_CONFIG_ERR_IRQ)
-		zdev->dpp_core_config_error =
-			readl(zuma_dpp0_dpp.base +
-			      ZUMA_DPP_CORE_CONFIG_ERROR);
+		WRITE_ONCE(zdev->dpp_core_config_error,
+			   readl(zuma_dpp0_dpp.base +
+				 ZUMA_DPP_CORE_CONFIG_ERROR));
 	if (core_status) {
+		atomic_or(core_status, &zdev->dpp_core_error_status);
 		ret = -EIO;
 		writel(core_status & ZUMA_DPP_CORE_ALL_IRQ_STATUS,
 		       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS);
@@ -1883,10 +2052,13 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 	writel(0, zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
 	writel(ZUMA_DPP_CORE_INHERITED_MASK,
 	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
-	restored = !zuma_dpp0_irq_profile_ready(0);
+	restored = !zuma_dpp0_irq_profile_ready(0, 0,
+						ZUMA_DPP_CORE_INHERITED_MASK);
+	zuma_dpp0_set_irq_owner_state(zdev, restored ?
+				      ZUMA_DPP0_IRQ_INHERITED :
+				      ZUMA_DPP0_IRQ_BROKEN);
 	if (!restored)
 		ret = -EIO;
-	zdev->dpp_irq_restored = restored;
 	return ret;
 }
 
@@ -1894,26 +2066,32 @@ static int
 zuma_dpp0_irq_prepare(struct zuma_drm *zdev,
 		      struct zuma_drm_irq_proof *proof)
 {
+	u32 inherited_status;
+	u32 inherited_value;
+
 	lockdep_assert_held(&zuma_display_mmio_lock);
 	if (!zuma_drm_irq_proof_is_armed(zdev) ||
-	    zdev->dpp_irq_routes_enabled || zdev->dpp_irq_mmio_touched ||
-	    zuma_dpp0_irq_profile_ready(ZUMA_DPP_RDMA_INHERITED_IRQ))
+	    zdev->dpp_irq_routes_enabled ||
+	    zuma_dpp0_irq_owner_state(zdev) != ZUMA_DPP0_IRQ_INHERITED ||
+	    zuma_dpp0_irq_inherited_ready())
 		return -EIO;
 
-	reinit_completion(&zdev->dpp_dma_completion);
-	reinit_completion(&zdev->dpp_core_completion);
-	proof->dpp_dma_before = atomic64_read(&zdev->dpp_dma_irq_count);
-	proof->dpp_core_before = atomic64_read(&zdev->dpp_core_irq_count);
-	proof->dpp_irq_active = true;
-	zdev->dpp_dma_status = 0;
-	zdev->dpp_core_status = 0;
-	zdev->dpp_dma_config_error = 0;
-	zdev->dpp_core_config_error = 0;
-	zdev->dpp_irq_restored = false;
-	zdev->dpp_irq_mmio_touched = true;
+	zuma_dpp0_irq_prepare_frame(zdev, proof);
+	inherited_value = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	inherited_status = inherited_value & ZUMA_DPP_RDMA_ALL_IRQ_STATUS;
+	if (inherited_status & ZUMA_DPP_RDMA_CONFIG_ERR_IRQ)
+		WRITE_ONCE(zdev->dpp_dma_config_error,
+			   readl(zuma_dpp0.base +
+				 ZUMA_DPP_RDMA_CONFIG_ERR_STATUS));
+	if ((inherited_status & ~ZUMA_DPP_RDMA_FRAME_DONE_IRQ) ||
+	    (inherited_value & ~ZUMA_DPP_RDMA_ALL_IRQ_STATUS)) {
+		WRITE_ONCE(zdev->dpp_dma_status, inherited_status);
+		atomic_or(inherited_status, &zdev->dpp_dma_error_status);
+		return -EIO;
+	}
+	zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_ACQUIRING);
 
-	writel(ZUMA_DPP_RDMA_INHERITED_IRQ |
-	       ZUMA_DPP_RDMA_MASKED_CONTROL,
+	writel(ZUMA_DPP_RDMA_MASKED_CONTROL | inherited_status,
 	       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
 	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) !=
 	    ZUMA_DPP_RDMA_MASKED_CONTROL)
@@ -1925,32 +2103,44 @@ zuma_dpp0_irq_prepare(struct zuma_drm *zdev,
 	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS))
 		return -EIO;
 
-	writel(ZUMA_DPP_RDMA_FRAME_CONTROL,
-	       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
-	writel(ZUMA_DPP_CORE_PROOF_MASK,
+	writel(0, zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	writel(ZUMA_DPP_CORE_OWNED_MASK,
 	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
-	writel(ZUMA_DPP_RDMA_PROOF_CONTROL,
+	writel(ZUMA_DPP_RDMA_OWNED_CONTROL,
 	       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
 	writel(ZUMA_DPP_CORE_IRQ_ENABLE,
 	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON);
-	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) !=
-	    ZUMA_DPP_RDMA_PROOF_CONTROL ||
-	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK) !=
-	    ZUMA_DPP_CORE_PROOF_MASK ||
-	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON) !=
-	    ZUMA_DPP_CORE_IRQ_ENABLE ||
-	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS))
+	if (zuma_dpp0_irq_owned_ready())
 		return -EIO;
 
 	zdev->dpp_irq_routes_enabled = true;
 	enable_irq(zdev->dpp_dma_irq);
 	enable_irq(zdev->dpp_core_irq);
-	pr_info("zuma-display-handoff: armed one-frame DPP0 IRQ proof dma=%d dpp=%d rdma=%#x dpp-con=%#x dpp-mask=%#x\n",
+	pr_info("zuma-display-handoff: acquiring persistent DPP0 IRQs dma=%d dpp=%d rdma=%#x dpp-con=%#x dpp-mask=%#x\n",
 		zdev->dpp_dma_irq, zdev->dpp_core_irq,
-		(u32)ZUMA_DPP_RDMA_PROOF_CONTROL,
+		(u32)ZUMA_DPP_RDMA_OWNED_CONTROL,
 		(u32)ZUMA_DPP_CORE_IRQ_ENABLE,
-		ZUMA_DPP_CORE_PROOF_MASK);
+		ZUMA_DPP_CORE_OWNED_MASK);
 	return 0;
+}
+
+static void zuma_drm_dpp_irq_fault_work(struct work_struct *work)
+{
+	struct zuma_drm *zdev =
+		container_of(work, struct zuma_drm, dpp_irq_fault_work);
+	int ret;
+
+	mutex_lock(&zuma_display_mmio_lock);
+	zuma_display_set_hw_trigger(false);
+	ret = zuma_dpp0_irq_restore(zdev);
+	mutex_unlock(&zuma_display_mmio_lock);
+	pr_err("zuma-display-handoff: DRM fault cleanup dma-status=%#x dma-errors=%#x dma-config=%#x dpp-status=%#x dpp-errors=%#x dpp-config=%#x restore=%s\n",
+	       READ_ONCE(zdev->dpp_dma_status),
+	       atomic_read(&zdev->dpp_dma_error_status),
+	       READ_ONCE(zdev->dpp_dma_config_error),
+	       READ_ONCE(zdev->dpp_core_status),
+	       atomic_read(&zdev->dpp_core_error_status),
+	       READ_ONCE(zdev->dpp_core_config_error), ret ? "failed" : "ok");
 }
 
 static int
@@ -1974,7 +2164,7 @@ zuma_dpp0_replay_prepare(struct zuma_drm *zdev, const char *operation,
 	*replay_frame = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
 	if (readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ))
 		goto fail_profile;
-	if (stage == ZUMA_DPP0_REPLAY_IRQ_PROOF) {
+	if (stage == ZUMA_DPP0_REPLAY_IRQ_TAKEOVER) {
 		if (zuma_dpp0_irq_prepare(zdev, proof))
 			goto fail_profile;
 		return 0;
@@ -2050,7 +2240,8 @@ fail_profile:
 static int
 zuma_dpp0_replay_complete(struct zuma_drm *zdev, const char *operation,
 			  u32 replay_frame, u32 frame_after,
-			  const struct zuma_drm_irq_proof *proof)
+			  const struct zuma_drm_irq_proof *proof,
+			  bool release_after_frame)
 {
 	const struct zuma_dpp0_replay_write *writes;
 	enum zuma_dpp0_replay_stage stage = zdev->replay_stage;
@@ -2063,26 +2254,44 @@ zuma_dpp0_replay_complete(struct zuma_drm *zdev, const char *operation,
 	lockdep_assert_held(&zuma_display_mmio_lock);
 	if (stage >= ZUMA_DPP0_REPLAY_DONE)
 		return 0;
-	if (stage == ZUMA_DPP0_REPLAY_IRQ_PROOF) {
+	if (stage == ZUMA_DPP0_REPLAY_IRQ_TAKEOVER) {
 		if (frame_after != replay_frame + 1 ||
-		    !proof->dpp_irq_active || !zdev->dpp_irq_restored ||
+		    !proof->dpp_irq_active ||
 		    proof->dpp_dma_after != proof->dpp_dma_before + 1 ||
 		    proof->dpp_core_after != proof->dpp_core_before + 1 ||
-		    zdev->dpp_dma_status != ZUMA_DPP_RDMA_FRAME_DONE_IRQ ||
-		    zdev->dpp_core_status != ZUMA_DPP_CORE_FRAME_DONE_IRQ ||
-		    zdev->dpp_dma_config_error ||
-		    zdev->dpp_core_config_error ||
-		    zuma_dpp0_irq_profile_ready(0))
+		    READ_ONCE(zdev->dpp_dma_status) !=
+			ZUMA_DPP_RDMA_FRAME_DONE_IRQ ||
+		    READ_ONCE(zdev->dpp_core_status) !=
+			ZUMA_DPP_CORE_FRAME_DONE_IRQ ||
+		    READ_ONCE(zdev->dpp_dma_config_error) ||
+		    READ_ONCE(zdev->dpp_core_config_error) ||
+		    atomic_read(&zdev->dpp_dma_error_status) ||
+		    atomic_read(&zdev->dpp_core_error_status))
 			goto fail_profile;
+		if (release_after_frame) {
+			if (!proof->dpp_irq_released ||
+			    zuma_dpp0_irq_owner_state(zdev) !=
+				ZUMA_DPP0_IRQ_INHERITED ||
+			    zuma_dpp0_irq_restored_ready())
+				goto fail_profile;
+		} else {
+			if (proof->dpp_irq_released ||
+			    zuma_dpp0_irq_owner_state(zdev) !=
+				ZUMA_DPP0_IRQ_ACQUIRING ||
+			    zuma_dpp0_irq_owned_ready())
+				goto fail_profile;
+			zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_OWNED);
+		}
 		zdev->replay_stage++;
-		pr_info("zuma-display-handoff: DPP0 one-frame IRQ proof proven on %s frame=%#x->%#x dma=%llu->%llu status=%#x dpp=%llu->%llu status=%#x restored=yes next=%s\n",
+		pr_info("zuma-display-handoff: persistent DPP0 IRQ takeover proven on %s frame=%#x->%#x dma=%llu->%llu status=%#x dpp=%llu->%llu status=%#x owner=%s next=%s\n",
 			operation, replay_frame, frame_after,
 			(unsigned long long)proof->dpp_dma_before,
 			(unsigned long long)proof->dpp_dma_after,
-			zdev->dpp_dma_status,
+			READ_ONCE(zdev->dpp_dma_status),
 			(unsigned long long)proof->dpp_core_before,
 			(unsigned long long)proof->dpp_core_after,
-			zdev->dpp_core_status,
+			READ_ONCE(zdev->dpp_core_status),
+			release_after_frame ? "released" : "active",
 			zuma_dpp0_replay_stage_name(zdev->replay_stage));
 		return 0;
 	}
@@ -2374,6 +2583,10 @@ static int zuma_display_trigger_frame(u32 *frame_before, u32 *frame_after)
 	u32 value;
 	int ret;
 
+	if (zuma_drm_device &&
+	    (!zuma_drm_irq_proof_is_armed(zuma_drm_device) ||
+	     READ_ONCE(zuma_drm_update_failed)))
+		return -EIO;
 	*frame_before = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
 	*frame_after = *frame_before;
 	zuma_display_set_hw_trigger(true);
@@ -2476,9 +2689,9 @@ static int zuma_drm_enable_irq_routes(struct zuma_drm *zdev)
 	if (zuma_drm_clear_frame_pending(true))
 		return -EIO;
 
+	zdev->irq_routes_enabled = true;
 	enable_irq(zdev->frame_start_irq);
 	enable_irq(zdev->frame_done_irq);
-	zdev->irq_routes_enabled = true;
 	pr_info("zuma-display-handoff: enabled DECON frame IRQ routes with master gated by DRM vblank refs\n");
 	return 0;
 }
@@ -2527,29 +2740,28 @@ static void zuma_drm_crtc_disable_vblank(struct drm_crtc *crtc)
 fail:
 	atomic_set(&zdev->irq_error, 1);
 	WRITE_ONCE(zuma_drm_update_failed, true);
+	queue_work(zdev->workqueue, &zdev->dpp_irq_fault_work);
 	pr_err("zuma-display-handoff: failed to gate DECON frame interrupts\n");
 }
 
 static int zuma_drm_quiesce_irq_proof(struct zuma_drm *zdev,
 				      bool allow_pending)
 {
-	int cleanup_ret;
-	int ret = 0;
-
-	if (zdev->dpp_irq_mmio_touched && !zdev->dpp_irq_restored)
-		ret = zuma_dpp0_irq_restore(zdev);
 	zuma_drm_set_irq_proof_armed(zdev, false);
+	if (zuma_dpp0_irq_handler_live(zdev) &&
+	    zdev->dpp_irq_routes_enabled) {
+		synchronize_irq(zdev->dpp_core_irq);
+		synchronize_irq(zdev->dpp_dma_irq);
+	}
 	synchronize_irq(zdev->frame_start_irq);
 	synchronize_irq(zdev->frame_done_irq);
-	cleanup_ret = zuma_drm_clear_frame_pending(allow_pending);
-	if (!ret)
-		ret = cleanup_ret;
-	return ret;
+	return zuma_drm_clear_frame_pending(allow_pending);
 }
 
 static int zuma_drm_prepare_irq_proof(struct zuma_drm *zdev,
 				      struct zuma_drm_irq_proof *proof)
 {
+	enum zuma_dpp0_irq_owner_state owner_state;
 	u32 int_en;
 	int ret;
 
@@ -2560,8 +2772,8 @@ static int zuma_drm_prepare_irq_proof(struct zuma_drm *zdev,
 		return -EIO;
 
 	ret = zuma_drm_quiesce_irq_proof(zdev, !zdev->irq_proven_once);
-	if (ret)
-		return ret;
+	if (ret || READ_ONCE(zuma_drm_update_failed))
+		return ret ? ret : -EIO;
 
 	reinit_completion(&zdev->frame_start_completion);
 	reinit_completion(&zdev->frame_done_completion);
@@ -2570,16 +2782,33 @@ static int zuma_drm_prepare_irq_proof(struct zuma_drm *zdev,
 	proof->frame_done_before = atomic64_read(&zdev->frame_done_irq_count);
 	proof->vblank_before = drm_crtc_vblank_count(&zdev->crtc);
 	atomic_set(&zdev->irq_error, 0);
+
+	owner_state = zuma_dpp0_irq_owner_state(zdev);
+	if (owner_state == ZUMA_DPP0_IRQ_OWNED) {
+		if (!zdev->dpp_irq_routes_enabled || zuma_dpp0_irq_owned_ready())
+			return -EIO;
+		zuma_dpp0_irq_prepare_frame(zdev, proof);
+	} else if (owner_state != ZUMA_DPP0_IRQ_INHERITED) {
+		return -EIO;
+	}
+
 	zuma_drm_set_irq_proof_armed(zdev, true);
+	if (READ_ONCE(zuma_drm_update_failed)) {
+		zuma_drm_quiesce_irq_proof(zdev, true);
+		return -EIO;
+	}
 	return 0;
 }
 
 static int zuma_drm_wait_frame_irqs(struct zuma_drm *zdev,
-				    struct zuma_drm_irq_proof *proof)
+				    struct zuma_drm_irq_proof *proof,
+				    bool release_after_frame)
 {
+	enum zuma_dpp0_irq_owner_state owner_state;
 	unsigned long deadline;
 	unsigned long timeout;
-	int cleanup_ret;
+	int cleanup_ret = 0;
+	int close_ret;
 	int ret = 0;
 
 	deadline = jiffies + msecs_to_jiffies(ZUMA_DECON_IRQ_TIMEOUT_MS);
@@ -2609,7 +2838,13 @@ static int zuma_drm_wait_frame_irqs(struct zuma_drm *zdev,
 			ret = -ETIMEDOUT;
 	}
 
-	cleanup_ret = zuma_drm_quiesce_irq_proof(zdev, false);
+	if (release_after_frame && proof->dpp_irq_active) {
+		cleanup_ret = zuma_dpp0_irq_restore(zdev);
+		proof->dpp_irq_released =
+			zuma_dpp0_irq_owner_state(zdev) ==
+			ZUMA_DPP0_IRQ_INHERITED;
+	}
+	close_ret = zuma_drm_quiesce_irq_proof(zdev, false);
 	proof->frame_start_after =
 		atomic64_read(&zdev->frame_start_irq_count);
 	proof->frame_done_after = atomic64_read(&zdev->frame_done_irq_count);
@@ -2618,16 +2853,42 @@ static int zuma_drm_wait_frame_irqs(struct zuma_drm *zdev,
 	proof->dpp_core_after = atomic64_read(&zdev->dpp_core_irq_count);
 	if (!ret && cleanup_ret)
 		ret = cleanup_ret;
-	if (!ret && atomic_read(&zdev->irq_error))
+	if (!ret && close_ret)
+		ret = close_ret;
+	if (!ret && (atomic_read(&zdev->irq_error) ||
+		     READ_ONCE(zuma_drm_update_failed)))
 		ret = -EIO;
 	if (!ret &&
 	    (proof->frame_start_after != proof->frame_start_before + 1 ||
 	     proof->frame_done_after != proof->frame_done_before + 1 ||
-	     proof->vblank_after != proof->vblank_before + 1 ||
-	     (proof->dpp_irq_active &&
-	      (proof->dpp_dma_after != proof->dpp_dma_before + 1 ||
-	       proof->dpp_core_after != proof->dpp_core_before + 1))))
+	     proof->vblank_after != proof->vblank_before + 1))
 		ret = -EIO;
+	if (!ret && proof->dpp_irq_active &&
+	    (proof->dpp_dma_after != proof->dpp_dma_before + 1 ||
+	     proof->dpp_core_after != proof->dpp_core_before + 1 ||
+	     READ_ONCE(zdev->dpp_dma_status) !=
+			ZUMA_DPP_RDMA_FRAME_DONE_IRQ ||
+	     READ_ONCE(zdev->dpp_core_status) !=
+			ZUMA_DPP_CORE_FRAME_DONE_IRQ ||
+	     READ_ONCE(zdev->dpp_dma_config_error) ||
+	     READ_ONCE(zdev->dpp_core_config_error) ||
+	     atomic_read(&zdev->dpp_dma_error_status) ||
+	     atomic_read(&zdev->dpp_core_error_status)))
+		ret = -EIO;
+
+	owner_state = zuma_dpp0_irq_owner_state(zdev);
+	if (!ret && proof->dpp_irq_active) {
+		if (release_after_frame) {
+			if (!proof->dpp_irq_released ||
+			    owner_state != ZUMA_DPP0_IRQ_INHERITED ||
+			    zuma_dpp0_irq_restored_ready())
+				ret = -EIO;
+		} else if ((owner_state != ZUMA_DPP0_IRQ_ACQUIRING &&
+			    owner_state != ZUMA_DPP0_IRQ_OWNED) ||
+			   zuma_dpp0_irq_owned_ready()) {
+			ret = -EIO;
+		}
+	}
 	if (!ret && readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
 	    ZUMA_DECON_INT_ACTIVE)
 		ret = -EIO;
@@ -2637,7 +2898,8 @@ static int zuma_drm_wait_frame_irqs(struct zuma_drm *zdev,
 }
 
 static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
-					  const char *operation)
+					  const char *operation,
+					  bool release_after_frame)
 {
 	struct zuma_drm_irq_proof proof = {};
 	enum zuma_dpp0_replay_stage replay_stage = zdev->replay_stage;
@@ -2645,9 +2907,11 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	u32 replay_frame = 0;
 	bool replay_pending = replay_stage < ZUMA_DPP0_REPLAY_DONE;
 	bool replay_started = false;
+	bool lifecycle_started = false;
 	bool trigger_issued = false;
 	bool vblank_ref = false;
 	int cleanup_ret;
+	int restore_ret;
 	int ret;
 
 	arch_sync_dma_for_device(zuma_framebuffer_phys, ZUMA_HANDOFF_FB_SIZE,
@@ -2673,6 +2937,16 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 					       &proof);
 		if (ret)
 			goto out_abort;
+	} else if (zuma_dpp0_irq_owner_state(zdev) ==
+		   ZUMA_DPP0_IRQ_INHERITED) {
+		lifecycle_started = true;
+		ret = zuma_dpp0_irq_prepare(zdev, &proof);
+		if (ret)
+			goto out_abort;
+	}
+	if (READ_ONCE(zuma_drm_update_failed)) {
+		ret = -EIO;
+		goto out_abort;
 	}
 	ret = zuma_display_request_active_window();
 	if (ret)
@@ -2681,7 +2955,7 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	ret = zuma_display_trigger_frame(&frame_before, &frame_after);
 	if (ret)
 		goto out_abort;
-	ret = zuma_drm_wait_frame_irqs(zdev, &proof);
+	ret = zuma_drm_wait_frame_irqs(zdev, &proof, release_after_frame);
 	if (ret)
 		goto out_abort;
 	if (!zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
@@ -2696,14 +2970,24 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 			goto out_abort;
 		}
 		ret = zuma_dpp0_replay_complete(zdev, operation, replay_frame,
-						frame_after, &proof);
+						frame_after, &proof,
+						release_after_frame);
 		if (ret)
 			goto out_abort;
+	} else if (lifecycle_started && !release_after_frame) {
+		if (zuma_dpp0_irq_owner_state(zdev) !=
+		    ZUMA_DPP0_IRQ_ACQUIRING) {
+			ret = -EIO;
+			goto out_abort;
+		}
+		zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_OWNED);
+		pr_info("zuma-display-handoff: persistent DPP0 IRQ ownership reacquired on %s\n",
+			operation);
 	}
 
 	zuma_drm_update_count++;
 	if (zuma_drm_update_count <= 8) {
-		pr_info("zuma-display-handoff: DRM %s %llu bytes=0..%zu frame=%#x->%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu\n",
+		pr_info("zuma-display-handoff: DRM %s %llu bytes=0..%zu frame=%#x->%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu owner=%u\n",
 			operation, (unsigned long long)zuma_drm_update_count,
 			(size_t)ZUMA_HANDOFF_FB_SIZE - 1,
 			frame_before, frame_after,
@@ -2712,7 +2996,12 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 			(unsigned long long)proof.frame_done_before,
 			(unsigned long long)proof.frame_done_after,
 			(unsigned long long)proof.vblank_before,
-			(unsigned long long)proof.vblank_after);
+			(unsigned long long)proof.vblank_after,
+			(unsigned long long)proof.dpp_dma_before,
+			(unsigned long long)proof.dpp_dma_after,
+			(unsigned long long)proof.dpp_core_before,
+			(unsigned long long)proof.dpp_core_after,
+			zuma_dpp0_irq_owner_state(zdev));
 		zuma_dpp0_preflight_snapshot(operation);
 	}
 
@@ -2722,8 +3011,9 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 out_abort:
 	zuma_display_set_hw_trigger(false);
 	cleanup_ret = zuma_drm_quiesce_irq_proof(zdev, true);
+	restore_ret = zuma_dpp0_irq_restore(zdev);
 	if (!ret)
-		ret = cleanup_ret;
+		ret = cleanup_ret ? cleanup_ret : restore_ret;
 	if (vblank_ref)
 		drm_crtc_vblank_put(&zdev->crtc);
 	synchronize_irq(zdev->frame_start_irq);
@@ -2731,13 +3021,13 @@ out_abort:
 	if (zuma_drm_clear_frame_pending(true) && !ret)
 		ret = -EIO;
 	WRITE_ONCE(zuma_drm_update_failed, true);
-	if (replay_started)
-		pr_err("zuma-display-handoff: R35 replay %s failed stage-unchanged trigger-issued=%s outcome=%s irq-mmio-touched=%s irq-restored=%s poison=yes\n",
+	if (replay_started || lifecycle_started)
+		pr_err("zuma-display-handoff: DPP0 stage %s failed stage-unchanged trigger-issued=%s outcome=%s owner=%u restore=%s poison=yes\n",
 		       zuma_dpp0_replay_stage_name(replay_stage),
 		       trigger_issued ? "yes" : "no",
 		       trigger_issued ? "uncertain" : "visible-frame-preserved",
-		       zdev->dpp_irq_mmio_touched ? "yes" : "no",
-		       zdev->dpp_irq_restored ? "yes" : "no");
+		       zuma_dpp0_irq_owner_state(zdev),
+		       restore_ret ? "failed" : "ok");
 	pr_err("zuma-display-handoff: DRM %s failed closed: %d, frame=%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu\n",
 	       operation, ret, frame_after,
 	       (unsigned long long)proof.frame_start_before,
@@ -2753,7 +3043,8 @@ out_abort:
 	return ret;
 }
 
-static int zuma_drm_commit_shadow(struct drm_atomic_commit *state)
+static int zuma_drm_commit_shadow(struct drm_atomic_commit *state,
+				  bool *fail_closed)
 {
 	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
 	struct drm_shadow_plane_state *shadow_plane_state;
@@ -2762,6 +3053,8 @@ static int zuma_drm_commit_shadow(struct drm_atomic_commit *state)
 	struct drm_framebuffer *fb;
 	int ret;
 
+	if (fail_closed)
+		*fail_closed = false;
 	new_plane_state =
 		drm_atomic_get_new_plane_state(state, &zdev->primary_plane);
 	if (!new_plane_state)
@@ -2783,14 +3076,18 @@ static int zuma_drm_commit_shadow(struct drm_atomic_commit *state)
 
 	mutex_lock(&zuma_display_mmio_lock);
 	if (!zuma_drm_scanout_update_ready()) {
+		if (fail_closed)
+			*fail_closed = true;
 		ret = -EIO;
 		goto out_unlock;
 	}
 
+	if (fail_closed)
+		*fail_closed = true;
 	iosys_map_memcpy_from(zuma_scanout_buffer,
 			      &shadow_plane_state->data[0], 0,
 			      ZUMA_HANDOFF_FB_SIZE);
-	ret = zuma_drm_finish_scanout_update(zdev, "shadow update");
+	ret = zuma_drm_finish_scanout_update(zdev, "shadow update", false);
 
 out_unlock:
 	mutex_unlock(&zuma_display_mmio_lock);
@@ -2814,15 +3111,65 @@ static int zuma_drm_restore_boot_buffer(struct zuma_drm *zdev)
 		   ZUMA_HANDOFF_FB_SIZE)) {
 		ret = -EIO;
 		WRITE_ONCE(zuma_drm_update_failed, true);
+		zuma_display_set_hw_trigger(false);
+		if (zuma_dpp0_irq_restore(zdev))
+			pr_err("zuma-display-handoff: DPP0 IRQ restore failed after boot copy failure\n");
 		pr_err("zuma-display-handoff: DRM boot restore copy failed closed\n");
 		goto out_unlock;
 	}
 
-	ret = zuma_drm_finish_scanout_update(zdev, "boot restore");
+	ret = zuma_drm_finish_scanout_update(zdev, "boot restore", true);
 
 out_unlock:
 	mutex_unlock(&zuma_display_mmio_lock);
 	return ret;
+}
+
+static int zuma_drm_reboot_notifier(struct notifier_block *notifier,
+				    unsigned long action, void *data)
+{
+	struct zuma_drm *zdev =
+		container_of(notifier, struct zuma_drm, reboot_notifier);
+	u32 int_en;
+	int cleanup_ret;
+	int ret = 0;
+
+	mutex_lock(&zdev->commit_admission_lock);
+	WRITE_ONCE(zuma_drm_update_failed, true);
+	mutex_unlock(&zdev->commit_admission_lock);
+	flush_workqueue(zdev->workqueue);
+
+	mutex_lock(&zuma_display_mmio_lock);
+	zuma_display_set_hw_trigger(false);
+	ret = zuma_dpp0_irq_restore(zdev);
+	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
+	if (int_en == ZUMA_DECON_INT_ACTIVE) {
+		writel(ZUMA_DECON_INT_QUIESCENT,
+		       zuma_decon0.base + ZUMA_DECON_INT_EN);
+		if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+		    ZUMA_DECON_INT_QUIESCENT)
+			ret = -EIO;
+	} else if (int_en != ZUMA_DECON_INT_QUIESCENT) {
+		ret = -EIO;
+	}
+	zuma_drm_set_irq_proof_armed(zdev, false);
+	cleanup_ret = zuma_drm_clear_frame_pending(true);
+	if (!ret)
+		ret = cleanup_ret;
+	if (zdev->irq_routes_enabled) {
+		disable_irq_nosync(zdev->frame_done_irq);
+		disable_irq_nosync(zdev->frame_start_irq);
+		zdev->irq_routes_enabled = false;
+		synchronize_irq(zdev->frame_done_irq);
+		synchronize_irq(zdev->frame_start_irq);
+	}
+	mutex_unlock(&zuma_display_mmio_lock);
+
+	cancel_work_sync(&zdev->dpp_irq_fault_work);
+	flush_workqueue(zdev->workqueue);
+	pr_info("zuma-display-handoff: reboot IRQ lifecycle shutdown restore=%s\n",
+		ret ? "failed" : "ok");
+	return NOTIFY_DONE;
 }
 
 static int zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
@@ -2871,6 +3218,7 @@ static int zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 
 out_failed:
 	WRITE_ONCE(zuma_drm_update_failed, true);
+	queue_work(zdev->workqueue, &zdev->dpp_irq_fault_work);
 	pr_err("zuma-display-handoff: DRM vblank event completion failed closed\n");
 	return -EIO;
 }
@@ -2934,16 +3282,27 @@ static void zuma_drm_commit_work(struct work_struct *work)
 {
 	struct drm_atomic_commit *state =
 		container_of(work, struct drm_atomic_commit, commit_work);
+	struct zuma_drm *zdev =
+		container_of(state->dev, struct zuma_drm, drm);
+	bool fail_closed = false;
 	int ret;
 
 	ret = drm_atomic_helper_wait_for_fences(state->dev, state, false);
 	drm_atomic_helper_wait_for_dependencies(state);
 	if (!ret)
-		ret = zuma_drm_commit_shadow(state);
-	if (ret) {
+		ret = zuma_drm_commit_shadow(state, &fail_closed);
+	if (ret && (fail_closed || READ_ONCE(zuma_drm_update_failed))) {
 		WRITE_ONCE(zuma_drm_update_failed, true);
+		mutex_lock(&zuma_display_mmio_lock);
+		zuma_display_set_hw_trigger(false);
+		if (zuma_dpp0_irq_restore(zdev))
+			pr_err("zuma-display-handoff: DPP0 IRQ restore failed after asynchronous update failure\n");
+		mutex_unlock(&zuma_display_mmio_lock);
 		pr_err("zuma-display-handoff: asynchronous DRM update failed closed: %d; "
 		       "flip event cancelled\n", ret);
+	} else if (ret) {
+		pr_err("zuma-display-handoff: asynchronous DRM update cancelled before framebuffer access: %d; flip event cancelled\n",
+		       ret);
 	}
 
 	zuma_drm_commit_tail(state, ret);
@@ -2997,16 +3356,20 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 		return ret;
 
 	if (nonblock) {
+		mutex_lock(&zdev->commit_admission_lock);
 		if (READ_ONCE(zuma_drm_update_failed)) {
 			ret = -EIO;
-			goto out_unprepare;
+		} else {
+			ret = drm_atomic_helper_swap_state(state, true);
+			if (!ret) {
+				drm_atomic_commit_get(state);
+				WARN_ON(!queue_work(zdev->workqueue,
+						    &state->commit_work));
+			}
 		}
-		ret = drm_atomic_helper_swap_state(state, true);
+		mutex_unlock(&zdev->commit_admission_lock);
 		if (ret)
 			goto out_unprepare;
-
-		drm_atomic_commit_get(state);
-		queue_work(system_dfl_wq, &state->commit_work);
 		return 0;
 	}
 
@@ -3018,7 +3381,7 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 	if (restore_boot)
 		ret = zuma_drm_restore_boot_buffer(zdev);
 	else
-		ret = zuma_drm_commit_shadow(state);
+		ret = zuma_drm_commit_shadow(state, NULL);
 	if (ret)
 		goto out_unprepare;
 
@@ -3027,6 +3390,9 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 		drm_crtc_vblank_put(&zdev->crtc);
 		mutex_lock(&zuma_display_mmio_lock);
 		WRITE_ONCE(zuma_drm_update_failed, true);
+		zuma_display_set_hw_trigger(false);
+		if (zuma_dpp0_irq_restore(zdev))
+			pr_err("zuma-display-handoff: DPP0 IRQ restore failed after state-swap failure\n");
 		mutex_unlock(&zuma_display_mmio_lock);
 		goto out_unprepare;
 	}
