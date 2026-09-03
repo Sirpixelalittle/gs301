@@ -113,7 +113,16 @@
 #define ZUMA_DECON_IRQ_TIMEOUT_MS       100
 
 #define ZUMA_DPP0_BASE                  0x19900000
-#define ZUMA_DPP0_MIN_SIZE              0x500
+#define ZUMA_DPP0_MIN_SIZE              0x1000
+#define ZUMA_DPP0_DPP_BASE              0x19930000
+#define ZUMA_DPP0_SCL_COEF_BASE         0x19940000
+#define ZUMA_DPP0_SRAMC_BASE            0x19950000
+#define ZUMA_DPP0_HDR_COMM_BASE         0x19960000
+#define ZUMA_DPP0_HDR_BASE              0x19980000
+#define ZUMA_DPP0_REG_SIZE              0x1000
+#define ZUMA_DPP0_SCL_COEF_SIZE         0x4000
+#define ZUMA_DPP0_DT_ATTR               0x006d0867
+#define ZUMA_DPP0_BL_EFFECTIVE_ATTR     0x004d0047
 
 #define ZUMA_SYSMMU_DPUF0_BASE          0x19840000
 #define ZUMA_SYSMMU_DPUF0_MIN_SIZE      0x9000
@@ -143,6 +152,8 @@
 #define ZUMA_DPP_RDMA_SRC_STRIDE_0      0x0050
 #define ZUMA_DPP_RDMA_EXPECTED          0x40000000
 #define ZUMA_DPP_RDMA_BUSY              BIT(2)
+#define ZUMA_DPP_RDMA_CONFIG_ERR_IRQ    BIT(21)
+#define ZUMA_DPP_RDMA_CONFIG_ERR_STATUS 0x0740
 #define ZUMA_DPP_FORMAT_SHIFT           8
 #define ZUMA_DPP_FORMAT_MASK            0x3f
 #define ZUMA_DPP_FORMAT_FIELD_MASK      \
@@ -185,6 +196,19 @@ struct zuma_display_block {
 	void __iomem *base;
 };
 
+struct zuma_dpp0_dt_resource {
+	const char *name;
+	resource_size_t start;
+	resource_size_t size;
+};
+
+struct zuma_dpp0_snapshot_reg {
+	const char *name;
+	u16 live;
+	u16 shadow;
+};
+
+#define ZUMA_DPP0_NO_SHADOW U16_MAX
 
 struct zuma_drm {
 	struct drm_device drm;
@@ -299,6 +323,30 @@ static struct zuma_display_block zuma_dpp0 = {
 	.min_size = ZUMA_DPP0_MIN_SIZE,
 };
 
+static struct zuma_display_block zuma_dpp0_dpp = {
+	.name = "DPP0 core",
+	.compatible = "samsung,exynos-dpp",
+	.phys = ZUMA_DPP0_DPP_BASE,
+	.min_size = ZUMA_DPP0_REG_SIZE,
+	.resource_index = 1,
+};
+
+static struct zuma_display_block zuma_dpp0_sramc = {
+	.name = "DPP0 SRAM controller",
+	.compatible = "samsung,exynos-dpp",
+	.phys = ZUMA_DPP0_SRAMC_BASE,
+	.min_size = ZUMA_DPP0_REG_SIZE,
+	.resource_index = 3,
+};
+
+static struct zuma_display_block zuma_dpp0_hdr_comm = {
+	.name = "DPP0 HDR common",
+	.compatible = "samsung,exynos-dpp",
+	.phys = ZUMA_DPP0_HDR_COMM_BASE,
+	.min_size = ZUMA_DPP0_REG_SIZE,
+	.resource_index = 4,
+};
+
 static struct zuma_display_block zuma_sysmmu_dpuf0 = {
 	.name = "DPUF0 SysMMU",
 	.compatible = "samsung,sysmmu-v9",
@@ -314,7 +362,63 @@ static struct zuma_display_block * const zuma_display_blocks[] = {
 	&zuma_decon0,
 	&zuma_decon0_wincon,
 	&zuma_dpp0,
+	&zuma_dpp0_dpp,
+	&zuma_dpp0_sramc,
+	&zuma_dpp0_hdr_comm,
 	&zuma_sysmmu_dpuf0,
+};
+
+static const struct zuma_dpp0_dt_resource zuma_dpp0_dt_resources[] = {
+	{ "dma", ZUMA_DPP0_BASE, ZUMA_DPP0_REG_SIZE },
+	{ "dpp", ZUMA_DPP0_DPP_BASE, ZUMA_DPP0_REG_SIZE },
+	{ "scl_coef", ZUMA_DPP0_SCL_COEF_BASE, ZUMA_DPP0_SCL_COEF_SIZE },
+	{ "sramc", ZUMA_DPP0_SRAMC_BASE, ZUMA_DPP0_REG_SIZE },
+	{ "hdr_comm", ZUMA_DPP0_HDR_COMM_BASE, ZUMA_DPP0_REG_SIZE },
+	{ "hdr", ZUMA_DPP0_HDR_BASE, ZUMA_DPP0_REG_SIZE },
+};
+
+static const struct zuma_dpp0_snapshot_reg zuma_dpp0_rdma_regs[] = {
+	{ "enable", 0x000, ZUMA_DPP0_NO_SHADOW },
+	{ "irq", 0x004, ZUMA_DPP0_NO_SHADOW },
+	{ "in-ctrl", 0x008, 0x408 },
+	{ "src-width", 0x010, 0x410 },
+	{ "src-height", 0x014, 0x414 },
+	{ "src-offset", 0x018, 0x418 },
+	{ "img-size", 0x01c, 0x41c },
+	{ "base-p0", 0x040, 0x440 },
+	{ "base-p1", 0x044, 0x444 },
+	{ "stride-p0", 0x050, 0x450 },
+	{ "afbc", 0x070, 0x470 },
+	{ "recovery", 0x080, 0x480 },
+	{ "deadlock", 0x100, 0x500 },
+	{ "qos-low", 0x130, ZUMA_DPP0_NO_SHADOW },
+	{ "qos-high", 0x134, ZUMA_DPP0_NO_SHADOW },
+	{ "dynamic-gating", 0x140, ZUMA_DPP0_NO_SHADOW },
+};
+
+static const struct zuma_dpp0_snapshot_reg zuma_dpp0_core_regs[] = {
+	{ "swrst", 0x004, ZUMA_DPP0_NO_SHADOW },
+	{ "irq-con", 0x010, ZUMA_DPP0_NO_SHADOW },
+	{ "irq-mask", 0x014, ZUMA_DPP0_NO_SHADOW },
+	{ "irq-status", 0x018, ZUMA_DPP0_NO_SHADOW },
+	{ "cfg-error", 0x01c, ZUMA_DPP0_NO_SHADOW },
+	{ "op-status", 0x030, ZUMA_DPP0_NO_SHADOW },
+	{ "io-con", 0x038, 0x138 },
+	{ "img-size", 0x03c, 0x13c },
+	{ "scl-ctrl", 0x080, 0x180 },
+	{ "scaled-size", 0x084, 0x184 },
+	{ "scl-hpos", 0x090, 0x190 },
+	{ "scl-vpos", 0x094, 0x194 },
+};
+
+static const struct zuma_dpp0_snapshot_reg zuma_dpp0_sramc_regs[] = {
+	{ "mode", 0x010, 0x810 },
+	{ "dst-position", 0x014, 0x814 },
+};
+
+static const struct zuma_dpp0_snapshot_reg zuma_dpp0_hdr_comm_regs[] = {
+	{ "io-con", 0x00c, 0x80c },
+	{ "size", 0x020, 0x820 },
 };
 
 static const unsigned int zuma_snapshot_intervals_ms[] = {
@@ -815,6 +919,196 @@ static int __init zuma_drm_late_init(void)
 }
 late_initcall(zuma_drm_late_init);
 
+static bool __init
+zuma_dpp0_dt_u32_matches(struct device_node *np, const char *name, u32 expected)
+{
+	const struct property *property;
+	u32 value;
+	int length;
+
+	property = of_find_property(np, name, &length);
+	if (!property || length != sizeof(__be32) ||
+	    of_property_read_u32(np, name, &value) || value != expected) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT invalid %s property\n",
+		       name);
+		return false;
+	}
+
+	pr_info("zuma-display-handoff: R34 DPP0 DT %s=%#x length=%d\n",
+		name, value, length);
+	return true;
+}
+
+static bool __init zuma_dpp0_dt_contract_valid(void)
+{
+	static const char * const irq_names[] = { "dma", "dpp" };
+	static const u32 irq_cells_expected[] = {
+		0, 0x100, 0x4, 0,
+		0, 0x109, 0x4, 0,
+	};
+	struct device_node *decon = NULL;
+	struct device_node *irq_parent = NULL;
+	struct device_node *member;
+	struct device_node *np = NULL;
+	const __be32 *irq_cells;
+	const __be32 *dpp_cells;
+	const char *name;
+	struct resource res;
+	resource_size_t size;
+	unsigned int route_count;
+	unsigned int route_index = UINT_MAX;
+	unsigned int route_matches = 0;
+	int count, length = 0;
+	unsigned int i;
+	bool valid = false;
+	u32 cells;
+
+	while ((np = of_find_compatible_node(np, NULL, "samsung,exynos-dpp"))) {
+		if (!of_address_to_resource(np, 0, &res) &&
+		    res.start == ZUMA_DPP0_BASE)
+			break;
+	}
+	if (!np) {
+		pr_err("zuma-display-handoff: R34 exact DPP0 DT node not found\n");
+		return false;
+	}
+	if (!of_device_is_available(np)) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT node is disabled\n");
+		goto out;
+	}
+
+	count = of_property_count_strings(np, "compatible");
+	if (count != 1 ||
+	    of_property_read_string_index(np, "compatible", 0, &name) ||
+	    strcmp(name, "samsung,exynos-dpp")) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT compatible mismatch\n");
+		goto out;
+	}
+
+	count = of_address_count(np);
+	if (count != (int)ARRAY_SIZE(zuma_dpp0_dt_resources)) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT resource count=%d expected=%zu\n",
+		       count, ARRAY_SIZE(zuma_dpp0_dt_resources));
+		goto out;
+	}
+	if (of_property_count_strings(np, "reg-names") != count) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT reg-names count mismatch\n");
+		goto out;
+	}
+	for (i = 0; i < (unsigned int)count; i++) {
+		if (of_property_read_string_index(np, "reg-names", i, &name) ||
+		    strcmp(name, zuma_dpp0_dt_resources[i].name) ||
+		    of_address_to_resource(np, i, &res)) {
+			pr_err("zuma-display-handoff: R34 DPP0 DT resource %u invalid\n",
+			       i);
+			goto out;
+		}
+		size = resource_size(&res);
+		if (res.start != zuma_dpp0_dt_resources[i].start ||
+		    size != zuma_dpp0_dt_resources[i].size) {
+			pr_err("zuma-display-handoff: R34 DPP0 DT resource %u %s mismatch %pr\n",
+			       i, name, &res);
+			goto out;
+		}
+		pr_info("zuma-display-handoff: R34 DPP0 DT resource[%u]=%s %pr\n",
+			i, name, &res);
+	}
+
+	if (!zuma_dpp0_dt_u32_matches(np, "attr", ZUMA_DPP0_DT_ATTR) ||
+	    !zuma_dpp0_dt_u32_matches(np, "port", 0) ||
+	    !zuma_dpp0_dt_u32_matches(np, "scale_down", 4) ||
+	    !zuma_dpp0_dt_u32_matches(np, "scale_up", 8) ||
+	    !zuma_dpp0_dt_u32_matches(np, "dpp,id", 0))
+		goto out;
+
+	if (of_property_count_strings(np, "interrupt-names") !=
+	    (int)ARRAY_SIZE(irq_names)) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT interrupt-names count mismatch\n");
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(irq_names); i++) {
+		if (of_property_read_string_index(np, "interrupt-names", i,
+						  &name) ||
+		    strcmp(name, irq_names[i])) {
+			pr_err("zuma-display-handoff: R34 DPP0 DT interrupt name %u invalid\n",
+			       i);
+			goto out;
+		}
+	}
+
+	irq_parent = of_irq_find_parent(np);
+	if (!irq_parent ||
+	    of_property_read_u32(irq_parent, "#interrupt-cells", &cells) ||
+	    cells != 4) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT interrupt parent invalid\n");
+		goto out;
+	}
+	irq_cells = of_get_property(np, "interrupts", &length);
+	if (!irq_cells || length != sizeof(irq_cells_expected)) {
+		pr_err("zuma-display-handoff: R34 DPP0 DT interrupts length=%d invalid\n",
+		       length);
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(irq_cells_expected); i++) {
+		if (be32_to_cpup(irq_cells + i) != irq_cells_expected[i]) {
+			pr_err("zuma-display-handoff: R34 DPP0 DT interrupt cell %u invalid\n",
+			       i);
+			goto out;
+		}
+	}
+	pr_info("zuma-display-handoff: R34 DPP0 DT irq dma=<0 %#x %#x 0> dpp=<0 %#x %#x 0>\n",
+		irq_cells_expected[1], irq_cells_expected[2],
+		irq_cells_expected[5], irq_cells_expected[6]);
+
+	while ((decon = of_find_compatible_node(decon, NULL, "samsung,exynos-decon"))) {
+		if (!of_address_to_resource(decon, 0, &res) &&
+		    res.start == ZUMA_DECON0_BASE)
+			break;
+	}
+	if (!decon || !of_device_is_available(decon)) {
+		pr_err("zuma-display-handoff: R34 exact DECON0 DT node unavailable\n");
+		goto out;
+	}
+	dpp_cells = of_get_property(decon, "dpps", &length);
+	if (!dpp_cells || length <= 0 || length % sizeof(*dpp_cells)) {
+		pr_err("zuma-display-handoff: R34 DECON0 dpps property invalid\n");
+		goto out;
+	}
+	route_count = length / sizeof(*dpp_cells);
+	for (i = 0; i < route_count; i++) {
+		member = of_parse_phandle(decon, "dpps", i);
+		if (!member) {
+			pr_err("zuma-display-handoff: R34 DECON0 dpps[%u] invalid\n",
+			       i);
+			goto out;
+		}
+		if (member == np) {
+			route_matches++;
+			route_index = i;
+		}
+		of_node_put(member);
+	}
+	if (route_matches != 1 || route_index != 0) {
+		pr_err("zuma-display-handoff: R34 DPP0 DECON0 membership matches=%u index=%u invalid\n",
+		       route_matches, route_index);
+		goto out;
+	}
+
+	pr_info("zuma-display-handoff: R34 DPP0 DT contract ok; DECON0 membership index=%u count=%u\n",
+		route_index, route_count);
+	pr_info("zuma-display-handoff: R34 DPP0 coverage dma=0x19900000+0x1000 dpp=0x19930000+0x1000 sramc=0x19950000+0x1000 hdr_comm=0x19960000+0x1000; scl_coef,hdr validated-unmapped\n");
+	pr_info("zuma-display-handoff: R34 DPP0 native-init-ready=no dt-attr=%#x bootloader-effective-attr=%#x unresolved=%#x\n",
+		ZUMA_DPP0_DT_ATTR, ZUMA_DPP0_BL_EFFECTIVE_ATTR,
+		ZUMA_DPP0_DT_ATTR ^ ZUMA_DPP0_BL_EFFECTIVE_ATTR);
+	valid = true;
+
+out:
+	of_node_put(decon);
+	of_node_put(irq_parent);
+	of_node_put(np);
+	return valid;
+}
+
 static int __init zuma_display_map(struct zuma_display_block *block)
 {
 	struct device_node *np = NULL;
@@ -920,6 +1214,114 @@ static bool zuma_display_sysmmu_bypassed(void)
 			ZUMA_SYSMMU_ATTRIBUTE_EXPECTED;
 }
 
+static void
+zuma_dpp0_read_snapshot(void __iomem *base,
+			const struct zuma_dpp0_snapshot_reg *regs,
+			size_t count, u32 *live, u32 *shadow)
+{
+	size_t i;
+
+	for (i = 0; i < (unsigned int)count; i++) {
+		live[i] = readl(base + regs[i].live);
+		if (regs[i].shadow != ZUMA_DPP0_NO_SHADOW)
+			shadow[i] = readl(base + regs[i].shadow);
+	}
+}
+
+static void
+zuma_dpp0_log_snapshot(const char *label, const char *region,
+		       const struct zuma_dpp0_snapshot_reg *regs,
+		       size_t count, const u32 *live, const u32 *shadow)
+{
+	size_t i;
+
+	for (i = 0; i < (unsigned int)count; i++) {
+		if (regs[i].shadow == ZUMA_DPP0_NO_SHADOW)
+			pr_info("zuma-display-handoff: R34 %s %s %s[%#x]=%#x\n",
+				label, region, regs[i].name, regs[i].live,
+				live[i]);
+		else
+			pr_info("zuma-display-handoff: R34 %s %s %s[%#x]=%#x shadow[%#x]=%#x\n",
+				label, region, regs[i].name, regs[i].live,
+				live[i], regs[i].shadow, shadow[i]);
+	}
+}
+
+static bool zuma_dpp0_preflight_snapshot(const char *label)
+{
+	u32 rdma_live[ARRAY_SIZE(zuma_dpp0_rdma_regs)];
+	u32 rdma_shadow[ARRAY_SIZE(zuma_dpp0_rdma_regs)] = { 0 };
+	u32 core_live[ARRAY_SIZE(zuma_dpp0_core_regs)];
+	u32 core_shadow[ARRAY_SIZE(zuma_dpp0_core_regs)] = { 0 };
+	u32 sramc_live[ARRAY_SIZE(zuma_dpp0_sramc_regs)];
+	u32 sramc_shadow[ARRAY_SIZE(zuma_dpp0_sramc_regs)] = { 0 };
+	u32 hdr_live[ARRAY_SIZE(zuma_dpp0_hdr_comm_regs)];
+	u32 hdr_shadow[ARRAY_SIZE(zuma_dpp0_hdr_comm_regs)] = { 0 };
+	u32 frame_before, frame_after;
+	u32 request_before, request_after;
+	u32 config_error = 0;
+	u32 dpub, dpuf0, dpuf1;
+
+	if (!zuma_display_domains_on(&dpub, &dpuf0, &dpuf1)) {
+		pr_info("zuma-display-handoff: R34 %s DPP0 snapshot skipped; domains DPUB=%#x DPUF0=%#x DPUF1=%#x\n",
+			label, dpub, dpuf0, dpuf1);
+		return false;
+	}
+
+	frame_before = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	request_before = readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	if (request_before) {
+		pr_info("zuma-display-handoff: R34 %s DPP0 snapshot rejected; frame=%#x shadow-request=%#x\n",
+			label, frame_before, request_before);
+		return false;
+	}
+
+	zuma_dpp0_read_snapshot(zuma_dpp0.base, zuma_dpp0_rdma_regs,
+				ARRAY_SIZE(zuma_dpp0_rdma_regs), rdma_live,
+				rdma_shadow);
+	if (rdma_live[1] & ZUMA_DPP_RDMA_CONFIG_ERR_IRQ)
+		config_error = readl(zuma_dpp0.base +
+				     ZUMA_DPP_RDMA_CONFIG_ERR_STATUS);
+	zuma_dpp0_read_snapshot(zuma_dpp0_dpp.base, zuma_dpp0_core_regs,
+				ARRAY_SIZE(zuma_dpp0_core_regs), core_live,
+				core_shadow);
+	zuma_dpp0_read_snapshot(zuma_dpp0_sramc.base, zuma_dpp0_sramc_regs,
+				ARRAY_SIZE(zuma_dpp0_sramc_regs), sramc_live,
+				sramc_shadow);
+	zuma_dpp0_read_snapshot(zuma_dpp0_hdr_comm.base,
+				zuma_dpp0_hdr_comm_regs,
+				ARRAY_SIZE(zuma_dpp0_hdr_comm_regs), hdr_live,
+				hdr_shadow);
+
+	frame_after = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	request_after = readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	if (frame_after != frame_before || request_after) {
+		pr_info("zuma-display-handoff: R34 %s DPP0 snapshot incoherent; frame=%#x->%#x shadow-request=%#x->%#x\n",
+			label, frame_before, frame_after, request_before,
+			request_after);
+		return false;
+	}
+
+	pr_info("zuma-display-handoff: R34 %s DPP0 coherent frame=%#x shadow-request=0\n",
+		label, frame_after);
+	zuma_dpp0_log_snapshot(label, "RDMA", zuma_dpp0_rdma_regs,
+			       ARRAY_SIZE(zuma_dpp0_rdma_regs), rdma_live,
+			       rdma_shadow);
+	if (rdma_live[1] & ZUMA_DPP_RDMA_CONFIG_ERR_IRQ)
+		pr_info("zuma-display-handoff: R34 %s RDMA config-error[%#x]=%#x\n",
+			label, ZUMA_DPP_RDMA_CONFIG_ERR_STATUS, config_error);
+	zuma_dpp0_log_snapshot(label, "DPP", zuma_dpp0_core_regs,
+			       ARRAY_SIZE(zuma_dpp0_core_regs), core_live,
+			       core_shadow);
+	zuma_dpp0_log_snapshot(label, "SRAMC", zuma_dpp0_sramc_regs,
+			       ARRAY_SIZE(zuma_dpp0_sramc_regs), sramc_live,
+			       sramc_shadow);
+	zuma_dpp0_log_snapshot(label, "HDR-COMM", zuma_dpp0_hdr_comm_regs,
+			       ARRAY_SIZE(zuma_dpp0_hdr_comm_regs), hdr_live,
+			       hdr_shadow);
+	return true;
+}
+
 static void zuma_display_snapshot(const char *label)
 {
 	u32 dpub, dpuf0, dpuf1;
@@ -985,6 +1387,7 @@ static void zuma_display_snapshot(const char *label)
 		readl(zuma_dsim0.base + ZUMA_DSIM_CLK_CTRL),
 		readl(zuma_dsim0.base + ZUMA_DSIM_RESOL),
 		readl(zuma_dsim0.base + ZUMA_DSIM_CONFIG));
+	zuma_dpp0_preflight_snapshot(label);
 }
 
 static bool __init zuma_display_scan_framebuffer(void)
@@ -1431,7 +1834,7 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	}
 
 	zuma_drm_update_count++;
-	if (zuma_drm_update_count <= 8)
+	if (zuma_drm_update_count <= 8) {
 		pr_info("zuma-display-handoff: DRM %s %llu bytes=0..%zu frame=%#x->%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu\n",
 			operation, (unsigned long long)zuma_drm_update_count,
 			(size_t)ZUMA_HANDOFF_FB_SIZE - 1,
@@ -1442,6 +1845,8 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 			(unsigned long long)proof.frame_done_after,
 			(unsigned long long)proof.vblank_before,
 			(unsigned long long)proof.vblank_after);
+		zuma_dpp0_preflight_snapshot(operation);
+	}
 
 	/* The post-swap tail owns this vblank reference after success. */
 	return 0;
@@ -2107,6 +2512,9 @@ static int __init zuma_display_handoff_init(void)
 		return 0;
 	}
 	of_node_put(root);
+
+	if (!zuma_dpp0_dt_contract_valid())
+		return 0;
 
 	for (i = 0; i < ARRAY_SIZE(zuma_display_blocks); i++) {
 		ret = zuma_display_map(zuma_display_blocks[i]);
