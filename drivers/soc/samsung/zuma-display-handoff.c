@@ -77,40 +77,140 @@
 #define ZUMA_DSIM_CONFIG                0x004c
 
 #define ZUMA_DECON0_BASE                0x19470000
-#define ZUMA_DECON0_MIN_SIZE            0x300
+#define ZUMA_DECON0_MIN_SIZE            0x6000
+#define ZUMA_DECON0_WIN_BASE            0x19480000
+#define ZUMA_DECON0_WIN_MIN_SIZE        0xe000
+#define ZUMA_DECON0_WIN_RESOURCE        1
+#define ZUMA_DECON0_SUB_BASE            0x19490000
+#define ZUMA_DECON0_SUB_MIN_SIZE        0x10000
+#define ZUMA_DECON0_SUB_RESOURCE        2
 #define ZUMA_DECON0_WINCON_BASE         0x194a0000
 #define ZUMA_DECON0_WINCON_MIN_SIZE     0xe000
 #define ZUMA_DECON0_WINCON_RESOURCE     3
 #define ZUMA_DECON_ACTIVE_WINDOW        5
 #define ZUMA_DECON_WINDOW_COUNT         14
-#define ZUMA_DECON_WINCON_STRIDE        0x1000
+#define ZUMA_DECON_WIN_STRIDE           0x1000
+#define ZUMA_DECON_SHADOW_OFFSET        0x0800
 #define ZUMA_DECON_WINCON_ENABLE        BIT(0)
+#define ZUMA_DECON_WINCON_MAP           BIT(1)
+#define ZUMA_DECON_WINCON_CHANNEL_MASK  GENMASK(7, 4)
+#define ZUMA_DECON_WINCON_CONTROL_MASK  \
+	(ZUMA_DECON_WINCON_CHANNEL_MASK | ZUMA_DECON_WINCON_MAP | \
+	 ZUMA_DECON_WINCON_ENABLE)
 #define ZUMA_DECON_WINCON_EXPECTED      ZUMA_DECON_WINCON_ENABLE
 #define ZUMA_DECON_SHD_REQ_ACTIVE       BIT(ZUMA_DECON_ACTIVE_WINDOW)
+#define ZUMA_DECON_NO_SHADOW            U16_MAX
+
 #define ZUMA_DECON_VERSION              0x0000
 #define ZUMA_DECON_FRAME_COUNT          0x0004
 #define ZUMA_DECON_GLOBAL_CON           0x0020
-#define ZUMA_DECON_TRIG_CON             0x0030
-#define ZUMA_DECON_SHD_REG_UP_REQ       0x0050
-#define ZUMA_DECON_INT_EN               0x0060
-#define ZUMA_DECON_INT_PEND             0x0070
-#define ZUMA_DECON_OF_SIZE_0            0x0290
-#define ZUMA_DECON_OF_PIXEL_ORDER       0x02a0
-
+#define ZUMA_DECON_GLOBAL_TEN_BPC       BIT(20)
+#define ZUMA_DECON_GLOBAL_COMMAND       BIT(8)
+#define ZUMA_DECON_GLOBAL_CONFIG_MASK   \
+	(ZUMA_DECON_GLOBAL_TEN_BPC | ZUMA_DECON_GLOBAL_COMMAND)
+#define ZUMA_DECON_GLOBAL_CONFIG        ZUMA_DECON_GLOBAL_COMMAND
 #define ZUMA_DECON_GLOBAL_EXPECTED      0x0133
 #define ZUMA_DECON_GLOBAL_IDLE          BIT(5)
-#define ZUMA_DECON_TRIG_EXPECTED        0x3070
+#define ZUMA_DECON_TRIG_CON             0x0030
+#define ZUMA_DECON_TRIG_HW_SELECT_MASK  GENMASK(25, 24)
+#define ZUMA_DECON_TRIG_SW_EN           BIT(8)
 #define ZUMA_DECON_TRIG_HW_MASK         BIT(4)
+#define ZUMA_DECON_TRIG_SW_DETECT       BIT(1)
 #define ZUMA_DECON_TRIG_HW_EN           BIT(0)
+#define ZUMA_DECON_TRIG_ADOPT_MASK      \
+	(ZUMA_DECON_TRIG_HW_SELECT_MASK | ZUMA_DECON_TRIG_SW_EN | \
+	 ZUMA_DECON_TRIG_HW_MASK | ZUMA_DECON_TRIG_SW_DETECT | \
+	 ZUMA_DECON_TRIG_HW_EN)
+#define ZUMA_DECON_TRIG_EXPECTED        0x3070
+#define ZUMA_DECON_SHD_REG_UP_REQ       0x0050
+#define ZUMA_DECON_INT_EN               0x0060
+#define ZUMA_DECON_INT_EN_EXTRA         0x0064
+#define ZUMA_DECON_INT_TIMEOUT_VAL      0x0068
+#define ZUMA_DECON_INT_PEND             0x0070
+#define ZUMA_DECON_INT_PEND_EXTRA       0x0074
 #define ZUMA_DECON_INT_MASTER           BIT(0)
+#define ZUMA_DECON_INT_EXTRA            BIT(4)
 #define ZUMA_DECON_INT_FRAME_START      BIT(12)
 #define ZUMA_DECON_INT_FRAME_DONE       BIT(13)
+#define ZUMA_DECON_INT_DQE_START        BIT(20)
+#define ZUMA_DECON_INT_DQE_END          BIT(21)
 #define ZUMA_DECON_INT_FRAME_MASK       \
 	(ZUMA_DECON_INT_FRAME_START | ZUMA_DECON_INT_FRAME_DONE)
-#define ZUMA_DECON_INT_QUIESCENT        ZUMA_DECON_INT_FRAME_MASK
-#define ZUMA_DECON_INT_ACTIVE           \
-	(ZUMA_DECON_INT_QUIESCENT | ZUMA_DECON_INT_MASTER)
+#define ZUMA_DECON_INT_STATUS_MASK      \
+	(ZUMA_DECON_INT_DQE_END | ZUMA_DECON_INT_DQE_START | \
+	 ZUMA_DECON_INT_FRAME_MASK | ZUMA_DECON_INT_EXTRA)
+#define ZUMA_DECON_INT_CONTROL_MASK     \
+	(ZUMA_DECON_INT_STATUS_MASK | ZUMA_DECON_INT_MASTER)
+#define ZUMA_DECON_INT_INHERITED_QUIESCENT ZUMA_DECON_INT_FRAME_MASK
+#define ZUMA_DECON_INT_INHERITED_ACTIVE \
+	(ZUMA_DECON_INT_INHERITED_QUIESCENT | ZUMA_DECON_INT_MASTER)
+#define ZUMA_DECON_INT_OWNED_QUIESCENT  \
+	(ZUMA_DECON_INT_FRAME_MASK | ZUMA_DECON_INT_EXTRA)
+#define ZUMA_DECON_INT_OWNED_ACTIVE     \
+	(ZUMA_DECON_INT_OWNED_QUIESCENT | ZUMA_DECON_INT_MASTER)
+#define ZUMA_DECON_EXTRA_UNMASK_START   BIT(24)
+#define ZUMA_DECON_EXTRA_TE_FALL        BIT(20)
+#define ZUMA_DECON_EXTRA_TE_RISE        BIT(16)
+#define ZUMA_DECON_EXTRA_DSIM_LATE      BIT(12)
+#define ZUMA_DECON_EXTRA_CWB_OFF        BIT(8)
+#define ZUMA_DECON_EXTRA_RESOURCE       BIT(4)
+#define ZUMA_DECON_EXTRA_TIMEOUT        BIT(0)
+#define ZUMA_DECON_EXTRA_STATUS_MASK    \
+	(ZUMA_DECON_EXTRA_UNMASK_START | ZUMA_DECON_EXTRA_TE_FALL | \
+	 ZUMA_DECON_EXTRA_TE_RISE | ZUMA_DECON_EXTRA_DSIM_LATE | \
+	 ZUMA_DECON_EXTRA_CWB_OFF | ZUMA_DECON_EXTRA_RESOURCE | \
+	 ZUMA_DECON_EXTRA_TIMEOUT)
+#define ZUMA_DECON_EXTRA_OWNED          \
+	(ZUMA_DECON_EXTRA_RESOURCE | ZUMA_DECON_EXTRA_TIMEOUT)
 #define ZUMA_DECON_IRQ_TIMEOUT_MS       100
+#define ZUMA_DRM_FENCE_TIMEOUT_MS       1000
+#define ZUMA_DRM_FENCE_POLL_MS          20
+
+#define ZUMA_DECON_RSC_STATUS_0         0x0100
+#define ZUMA_DECON_RSC_STATUS_2         0x0108
+#define ZUMA_DECON_RSC_STATUS_4         0x0110
+#define ZUMA_DECON_RSC_STATUS_5         0x0114
+#define ZUMA_DECON_DATA_PATH_CON_0      0x0200
+#define ZUMA_DECON_DATA_PATH_MASK       GENMASK(7, 0)
+#define ZUMA_DECON_DATA_PATH_FIXED      0xb1
+#define ZUMA_DECON_BG_SIZE              0x0220
+#define ZUMA_DECON_BG_SIZE_FIXED        0x0bb00540
+#define ZUMA_DECON_OF_SIZE_0            0x0290
+#define ZUMA_DECON_OF_SIZE_0_FIXED      0x0bb000e0
+#define ZUMA_DECON_OF_SIZE_1            0x0294
+#define ZUMA_DECON_OF_SIZE_2            0x0298
+#define ZUMA_DECON_OF_THRESHOLD         0x029c
+#define ZUMA_DECON_OF_THRESHOLD_MASK    GENMASK(2, 0)
+#define ZUMA_DECON_OF_THRESHOLD_FIXED   5
+#define ZUMA_DECON_OF_PIXEL_ORDER       0x02a0
+#define ZUMA_DECON_OF_PIXEL_ORDER_MASK  GENMASK(6, 4)
+#define ZUMA_DECON_OF_URGENT_EN         0x02c0
+#define ZUMA_DECON_OF_URGENT_MASK       GENMASK(1, 0)
+#define ZUMA_DECON_OF_RD_URGENT         0x02c4
+#define ZUMA_DECON_OF_RD_WAIT           0x02c8
+#define ZUMA_DECON_OF_WR_URGENT         0x02cc
+#define ZUMA_DECON_OF_DTA_CONTROL       0x02d0
+#define ZUMA_DECON_OF_DTA_MASK          BIT(0)
+#define ZUMA_DECON_OF_DTA_THRESHOLD     0x02d4
+#define ZUMA_DECON_WIN_FUNC_0           0x0004
+#define ZUMA_DECON_WIN_FUNC_0_MASK      0xffff0f03
+#define ZUMA_DECON_WIN_FUNC_0_INHERITED 0x00000102
+#define ZUMA_DECON_WIN_FUNC_1           0x0008
+#define ZUMA_DECON_WIN_FUNC_1_MASK      0x0f0f0f0f
+#define ZUMA_DECON_WIN_FUNC_1_INHERITED 0x00000000
+#define ZUMA_DECON_WIN_START            0x000c
+#define ZUMA_DECON_WIN_END              0x0010
+#define ZUMA_DECON_WIN_POSITION_MASK    0x3fff3fff
+#define ZUMA_DECON_WIN_END_FIXED        0x0baf053f
+#define ZUMA_DECON_WIN_COLORMAP_0       0x0014
+#define ZUMA_DECON_WIN_COLORMAP_0_MASK  0x00ff03ff
+#define ZUMA_DECON_WIN_COLORMAP_1       0x0018
+#define ZUMA_DECON_WIN_COLORMAP_1_MASK  0x03ff03ff
+#define ZUMA_DECON_WIN_START_TIME       0x001c
+#define ZUMA_DECON_SUB_DSC0_CONTROL1    0x0004
+#define ZUMA_DECON_SUB_DSC1_CONTROL1    0x1004
+#define ZUMA_DECON_SUB_DSIMIF0_SEL      0x8000
+#define ZUMA_DECON_SUB_DSIMIF1_SEL      0x9000
 
 #define ZUMA_DPP0_BASE                  0x19900000
 #define ZUMA_DPP0_MIN_SIZE              0x1000
@@ -250,7 +350,7 @@ struct zuma_display_block {
 	void __iomem *base;
 };
 
-struct zuma_dpp0_dt_resource {
+struct zuma_dt_resource {
 	const char *name;
 	resource_size_t start;
 	resource_size_t size;
@@ -284,6 +384,52 @@ enum zuma_dpp0_irq_owner_state {
 	ZUMA_DPP0_IRQ_BROKEN,
 };
 
+enum zuma_decon_irq_owner_state {
+	ZUMA_DECON_IRQ_INHERITED,
+	ZUMA_DECON_IRQ_ACQUIRING,
+	ZUMA_DECON_IRQ_OWNED,
+	ZUMA_DECON_IRQ_BROKEN,
+	ZUMA_DECON_IRQ_SHUTDOWN,
+};
+
+enum zuma_decon_entry_region {
+	ZUMA_DECON_PROFILE_MAIN,
+	ZUMA_DECON_PROFILE_WIN,
+	ZUMA_DECON_PROFILE_WINCON,
+};
+
+#define ZUMA_DECON_PROFILE_REG_COUNT     20
+#define ZUMA_DECON_WINDOW_WORD_COUNT    8
+#define ZUMA_DECON_DSIMIF_COUNT         2
+#define ZUMA_DECON_DSIMIF_WORD_COUNT    8
+#define ZUMA_DECON_DSC_COUNT            2
+#define ZUMA_DECON_DSC_WORD_COUNT       26
+
+/* Raw entry snapshots: never rebased after acquisition or masked on compare. */
+struct zuma_decon_protected_state {
+	u32 profile_live[ZUMA_DECON_PROFILE_REG_COUNT];
+	u32 profile_shadow[ZUMA_DECON_PROFILE_REG_COUNT];
+	u32 window_live[ZUMA_DECON_WINDOW_WORD_COUNT];
+	u32 window_shadow[ZUMA_DECON_WINDOW_WORD_COUNT];
+	u32 window_control;
+	u32 window_control_shadow;
+	u32 of_size_1[2];
+	u32 of_size_2[2];
+	u32 dsimif[ZUMA_DECON_DSIMIF_COUNT]
+		  [ZUMA_DECON_DSIMIF_WORD_COUNT][2];
+	u32 dsc[ZUMA_DECON_DSC_COUNT][ZUMA_DECON_DSC_WORD_COUNT][2];
+	u32 timeout_value;
+};
+
+struct zuma_decon_entry_reg {
+	const char *name;
+	enum zuma_decon_entry_region region;
+	u16 live;
+	u16 shadow;
+	u32 mask;
+	u32 value;
+};
+
 struct zuma_dpp0_profile_reg {
 	const char *name;
 	enum zuma_dpp0_replay_region region;
@@ -311,8 +457,16 @@ struct zuma_drm {
 	atomic_t dpp_core_error_status;
 	int frame_start_irq;
 	int frame_done_irq;
+	int extra_irq;
 	int dpp_dma_irq;
 	int dpp_core_irq;
+	u32 decon_main_status;
+	u32 decon_extra_status;
+	u32 decon_timeout_value;
+	u32 decon_resource_status[4];
+	u32 decon_inherited_int_en;
+	u32 decon_inherited_extra_en;
+	struct zuma_decon_protected_state decon_protected;
 	u32 dpp_dma_status;
 	u32 dpp_dma_control;
 	u32 dpp_core_status;
@@ -323,7 +477,9 @@ struct zuma_drm {
 	bool irq_proof_armed;
 	bool irq_routes_enabled;
 	bool irq_proven_once;
+	bool decon_protected_valid;
 	bool dpp_irq_routes_enabled;
+	enum zuma_decon_irq_owner_state decon_irq_owner_state;
 	enum zuma_dpp0_replay_stage replay_stage;
 	enum zuma_dpp0_irq_owner_state dpp_irq_owner_state;
 	struct workqueue_struct *workqueue;
@@ -419,6 +575,22 @@ static struct zuma_display_block zuma_decon0 = {
 	.min_size = ZUMA_DECON0_MIN_SIZE,
 };
 
+static struct zuma_display_block zuma_decon0_win = {
+	.name = "DECON0 window",
+	.compatible = "samsung,exynos-decon",
+	.phys = ZUMA_DECON0_WIN_BASE,
+	.min_size = ZUMA_DECON0_WIN_MIN_SIZE,
+	.resource_index = ZUMA_DECON0_WIN_RESOURCE,
+};
+
+static struct zuma_display_block zuma_decon0_sub = {
+	.name = "DECON0 sub",
+	.compatible = "samsung,exynos-decon",
+	.phys = ZUMA_DECON0_SUB_BASE,
+	.min_size = ZUMA_DECON0_SUB_MIN_SIZE,
+	.resource_index = ZUMA_DECON0_SUB_RESOURCE,
+};
+
 static struct zuma_display_block zuma_decon0_wincon = {
 	.name = "DECON0 window control",
 	.compatible = "samsung,exynos-decon",
@@ -471,6 +643,8 @@ static struct zuma_display_block * const zuma_display_blocks[] = {
 	&zuma_dpuf1,
 	&zuma_dsim0,
 	&zuma_decon0,
+	&zuma_decon0_win,
+	&zuma_decon0_sub,
 	&zuma_decon0_wincon,
 	&zuma_dpp0,
 	&zuma_dpp0_dpp,
@@ -479,7 +653,28 @@ static struct zuma_display_block * const zuma_display_blocks[] = {
 	&zuma_sysmmu_dpuf0,
 };
 
-static const struct zuma_dpp0_dt_resource zuma_dpp0_dt_resources[] = {
+static const struct zuma_dt_resource zuma_decon0_dt_resources[] = {
+	{ "main", ZUMA_DECON0_BASE, ZUMA_DECON0_MIN_SIZE },
+	{ "win", ZUMA_DECON0_WIN_BASE, ZUMA_DECON0_WIN_MIN_SIZE },
+	{ "sub", ZUMA_DECON0_SUB_BASE, ZUMA_DECON0_SUB_MIN_SIZE },
+	{ "wincon", ZUMA_DECON0_WINCON_BASE, ZUMA_DECON0_WINCON_MIN_SIZE },
+};
+
+static const char * const zuma_decon0_irq_names[] = {
+	"frame_start", "frame_done", "extra",
+	"dimming_start", "dimming_end", "cgc-dma",
+};
+
+static const u32 zuma_decon0_irq_cells[] = {
+	0, 0xf3, 4, 0,
+	0, 0xf2, 4, 0,
+	0, 0xf1, 4, 0,
+	0, 0xf0, 4, 0,
+	0, 0xef, 4, 0,
+	0, 0xff, 4, 0,
+};
+
+static const struct zuma_dt_resource zuma_dpp0_dt_resources[] = {
 	{ "dma", ZUMA_DPP0_BASE, ZUMA_DPP0_REG_SIZE },
 	{ "dpp", ZUMA_DPP0_DPP_BASE, ZUMA_DPP0_REG_SIZE },
 	{ "scl_coef", ZUMA_DPP0_SCL_COEF_BASE, ZUMA_DPP0_SCL_COEF_SIZE },
@@ -487,6 +682,120 @@ static const struct zuma_dpp0_dt_resource zuma_dpp0_dt_resources[] = {
 	{ "hdr_comm", ZUMA_DPP0_HDR_COMM_BASE, ZUMA_DPP0_REG_SIZE },
 	{ "hdr", ZUMA_DPP0_HDR_BASE, ZUMA_DPP0_REG_SIZE },
 };
+
+static const u16 zuma_decon_dsimif_offsets[] = {
+	0x000, 0x004, 0x008, 0x00c, 0x080, 0x084, 0x088, 0x08c,
+};
+
+static const u16 zuma_decon_dsc_offsets[] = {
+	0x004, 0x008, 0x00c, 0x010,
+	0x020, 0x024, 0x028, 0x02c,
+	0x040, 0x044, 0x048, 0x04c, 0x050, 0x054, 0x058, 0x05c,
+	0x060, 0x064, 0x068, 0x06c, 0x070, 0x074, 0x078, 0x07c,
+	0x080, 0x084,
+};
+
+/*
+ * Entry requirements, not a programming recipe. R42 observed this one coherent
+ * inherited profile at registration; real-commit entry must validate it again.
+ * Urgent/DTA and WIN5 functions are preserved exactly, not normalized to the
+ * Android initialization/composition policy. No per-register alternatives.
+ *
+ * Ownership is limited to IRQ controls/routes and normal frame transactions.
+ * The raw protected snapshot separately guards every listed full word and the
+ * wider window/output/DSIMIF/DSC state. Future functional initialization needs
+ * its own transition/latch contract, not writes through this entry table.
+ */
+static const struct zuma_decon_entry_reg zuma_decon_entry_profile[] = {
+	{ "global-config", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_GLOBAL_CON,
+	  ZUMA_DECON_GLOBAL_CON + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_GLOBAL_CONFIG_MASK, ZUMA_DECON_GLOBAL_CONFIG },
+	{ "trigger", ZUMA_DECON_PROFILE_MAIN, ZUMA_DECON_TRIG_CON,
+	  ZUMA_DECON_NO_SHADOW, ZUMA_DECON_TRIG_ADOPT_MASK,
+	  ZUMA_DECON_TRIG_HW_MASK },
+	{ "data-path", ZUMA_DECON_PROFILE_MAIN, ZUMA_DECON_DATA_PATH_CON_0,
+	  ZUMA_DECON_DATA_PATH_CON_0 + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_DATA_PATH_MASK, ZUMA_DECON_DATA_PATH_FIXED },
+	{ "background-size", ZUMA_DECON_PROFILE_MAIN, ZUMA_DECON_BG_SIZE,
+	  ZUMA_DECON_BG_SIZE + ZUMA_DECON_SHADOW_OFFSET, U32_MAX,
+	  ZUMA_DECON_BG_SIZE_FIXED },
+	{ "outfifo-size0", ZUMA_DECON_PROFILE_MAIN, ZUMA_DECON_OF_SIZE_0,
+	  ZUMA_DECON_OF_SIZE_0 + ZUMA_DECON_SHADOW_OFFSET, U32_MAX,
+	  ZUMA_DECON_OF_SIZE_0_FIXED },
+	{ "outfifo-threshold", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_THRESHOLD,
+	  ZUMA_DECON_OF_THRESHOLD + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_OF_THRESHOLD_MASK, ZUMA_DECON_OF_THRESHOLD_FIXED },
+	{ "outfifo-order", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_PIXEL_ORDER,
+	  ZUMA_DECON_OF_PIXEL_ORDER + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_OF_PIXEL_ORDER_MASK, 0 },
+	{ "urgent-enable", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_URGENT_EN, ZUMA_DECON_NO_SHADOW,
+	  U32_MAX, 0 },
+	{ "read-urgent", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_RD_URGENT, ZUMA_DECON_NO_SHADOW, U32_MAX,
+	  0 },
+	{ "read-wait", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_RD_WAIT, ZUMA_DECON_NO_SHADOW, U32_MAX, 0 },
+	{ "write-urgent", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_WR_URGENT, ZUMA_DECON_NO_SHADOW, U32_MAX, 0 },
+	{ "dta-enable", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_DTA_CONTROL, ZUMA_DECON_NO_SHADOW,
+	  U32_MAX, 0 },
+	{ "dta-threshold", ZUMA_DECON_PROFILE_MAIN,
+	  ZUMA_DECON_OF_DTA_THRESHOLD, ZUMA_DECON_NO_SHADOW, U32_MAX,
+	  0 },
+	{ "window-function0", ZUMA_DECON_PROFILE_WIN,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_FUNC_0,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_FUNC_0 + ZUMA_DECON_SHADOW_OFFSET,
+	  U32_MAX, ZUMA_DECON_WIN_FUNC_0_INHERITED },
+	{ "window-function1", ZUMA_DECON_PROFILE_WIN,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_FUNC_1,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_FUNC_1 + ZUMA_DECON_SHADOW_OFFSET,
+	  U32_MAX, ZUMA_DECON_WIN_FUNC_1_INHERITED },
+	{ "window-start", ZUMA_DECON_PROFILE_WIN,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_START,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_START + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_WIN_POSITION_MASK, 0 },
+	{ "window-end", ZUMA_DECON_PROFILE_WIN,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_END,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_END + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_WIN_POSITION_MASK, ZUMA_DECON_WIN_END_FIXED },
+	{ "window-colormap0", ZUMA_DECON_PROFILE_WIN,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_COLORMAP_0,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_COLORMAP_0 + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_WIN_COLORMAP_0_MASK, 0 },
+	{ "window-colormap1", ZUMA_DECON_PROFILE_WIN,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_COLORMAP_1,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_WIN_COLORMAP_1 + ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_WIN_COLORMAP_1_MASK, 0 },
+	{ "window-control", ZUMA_DECON_PROFILE_WINCON,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE,
+	  ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE +
+	  ZUMA_DECON_SHADOW_OFFSET,
+	  ZUMA_DECON_WINCON_CONTROL_MASK, ZUMA_DECON_WINCON_EXPECTED },
+};
+
+static_assert(ARRAY_SIZE(zuma_decon_entry_profile) ==
+	      ZUMA_DECON_PROFILE_REG_COUNT);
+static_assert(ARRAY_SIZE(zuma_decon_dsimif_offsets) ==
+	      ZUMA_DECON_DSIMIF_WORD_COUNT);
+static_assert(ARRAY_SIZE(zuma_decon_dsc_offsets) ==
+	      ZUMA_DECON_DSC_WORD_COUNT);
 
 static const struct zuma_dpp0_snapshot_reg zuma_dpp0_rdma_regs[] = {
 	{ "enable", 0x000, ZUMA_DPP0_NO_SHADOW },
@@ -642,6 +951,22 @@ static int zuma_drm_connector_get_modes(struct drm_connector *connector)
 						    &zuma_drm_fixed_mode);
 }
 
+static bool zuma_drm_fb_layout_valid(struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj;
+	u64 required;
+
+	if (fb->pitches[0] < ZUMA_HANDOFF_FB_STRIDE ||
+	    fb->pitches[0] % sizeof(u32) || fb->offsets[0])
+		return false;
+
+	/* Check the final visible byte in u64, including for imported buffers. */
+	required = (u64)(ZUMA_HANDOFF_FB_HEIGHT - 1) * fb->pitches[0] +
+		   ZUMA_HANDOFF_FB_STRIDE;
+	obj = drm_gem_fb_get_obj(fb, 0);
+	return obj && required <= obj->size;
+}
+
 static int zuma_drm_primary_plane_atomic_check(struct drm_plane *plane,
 					       struct drm_atomic_commit *state)
 {
@@ -695,7 +1020,7 @@ static int zuma_drm_primary_plane_atomic_check(struct drm_plane *plane,
 	    fb->modifier != DRM_FORMAT_MOD_LINEAR ||
 	    fb->width != ZUMA_HANDOFF_FB_WIDTH ||
 	    fb->height != ZUMA_HANDOFF_FB_HEIGHT ||
-	    fb->pitches[0] != ZUMA_HANDOFF_FB_STRIDE || fb->offsets[0] ||
+	    !zuma_drm_fb_layout_valid(fb) ||
 	    new_plane_state->src_x || new_plane_state->src_y ||
 	    new_plane_state->src_w != ZUMA_HANDOFF_FB_WIDTH << 16 ||
 	    new_plane_state->src_h != ZUMA_HANDOFF_FB_HEIGHT << 16 ||
@@ -828,6 +1153,10 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 				  struct drm_atomic_commit *state,
 				  bool nonblock);
 static void zuma_display_set_hw_trigger(bool unmask);
+static bool zuma_decon_pending_zero(struct zuma_drm *zdev);
+static int zuma_decon_fail_quiesce(struct zuma_drm *zdev);
+static int zuma_decon_enable_owned_irq_routes(struct zuma_drm *zdev);
+static void zuma_decon_disable_irq_routes(struct zuma_drm *zdev);
 static void zuma_drm_dpp_irq_fault_work(struct work_struct *work);
 static int zuma_drm_reboot_notifier(struct notifier_block *notifier,
 				    unsigned long action, void *data);
@@ -862,6 +1191,50 @@ static void zuma_drm_set_irq_proof_armed(struct zuma_drm *zdev, bool armed)
 	smp_store_release(&zdev->irq_proof_armed, armed);
 }
 
+static enum zuma_decon_irq_owner_state
+zuma_decon_irq_owner_state(struct zuma_drm *zdev)
+{
+	/* Pair with publication before native DECON Linux IRQ use. */
+	return smp_load_acquire(&zdev->decon_irq_owner_state);
+}
+
+static void
+zuma_decon_set_irq_owner_state(struct zuma_drm *zdev,
+			       enum zuma_decon_irq_owner_state state)
+{
+	/* Publish ownership only at a complete IRQ lifecycle boundary. */
+	smp_store_release(&zdev->decon_irq_owner_state, state);
+}
+
+static bool zuma_decon_irq_handler_live(struct zuma_drm *zdev)
+{
+	enum zuma_decon_irq_owner_state state =
+		zuma_decon_irq_owner_state(zdev);
+
+	return state == ZUMA_DECON_IRQ_ACQUIRING ||
+	       state == ZUMA_DECON_IRQ_OWNED;
+}
+
+static u32 zuma_decon_int_quiescent(struct zuma_drm *zdev)
+{
+	switch (zuma_decon_irq_owner_state(zdev)) {
+	case ZUMA_DECON_IRQ_INHERITED:
+		return ZUMA_DECON_INT_INHERITED_QUIESCENT;
+	case ZUMA_DECON_IRQ_ACQUIRING:
+	case ZUMA_DECON_IRQ_OWNED:
+		return ZUMA_DECON_INT_OWNED_QUIESCENT;
+	default:
+		return 0;
+	}
+}
+
+static u32 zuma_decon_int_active(struct zuma_drm *zdev)
+{
+	u32 quiescent = zuma_decon_int_quiescent(zdev);
+
+	return quiescent ? quiescent | ZUMA_DECON_INT_MASTER : 0;
+}
+
 static enum zuma_dpp0_irq_owner_state
 zuma_dpp0_irq_owner_state(struct zuma_drm *zdev)
 {
@@ -887,7 +1260,7 @@ static bool zuma_dpp0_irq_handler_live(struct zuma_drm *zdev)
 	       state == ZUMA_DPP0_IRQ_RELEASING;
 }
 
-static void zuma_drm_latch_irq_fault(struct zuma_drm *zdev)
+static void zuma_drm_mark_irq_fault(struct zuma_drm *zdev)
 {
 	atomic_set(&zdev->irq_error, 1);
 	WRITE_ONCE(zuma_drm_update_failed, true);
@@ -895,6 +1268,11 @@ static void zuma_drm_latch_irq_fault(struct zuma_drm *zdev)
 	complete(&zdev->frame_done_completion);
 	complete(&zdev->dpp_dma_completion);
 	complete(&zdev->dpp_core_completion);
+}
+
+static void zuma_drm_latch_irq_fault(struct zuma_drm *zdev)
+{
+	zuma_drm_mark_irq_fault(zdev);
 	if (zdev->workqueue)
 		queue_work(zdev->workqueue, &zdev->dpp_irq_fault_work);
 }
@@ -904,9 +1282,11 @@ zuma_drm_handle_frame_irq(struct zuma_drm *zdev, u32 mask,
 			  atomic64_t *counter, struct completion *completion,
 			  bool account_vblank)
 {
+	bool handler_live;
 	bool proof_armed;
 	u32 pending;
 
+	handler_live = zuma_decon_irq_handler_live(zdev);
 	proof_armed = zuma_drm_irq_proof_is_armed(zdev);
 	pending = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND);
 	if (!(pending & mask)) {
@@ -915,19 +1295,21 @@ zuma_drm_handle_frame_irq(struct zuma_drm *zdev, u32 mask,
 		return IRQ_NONE;
 	}
 
-	writel(mask, zuma_decon0.base + ZUMA_DECON_INT_PEND);
+	/* DECON pending bits are W1C: acknowledge only sampled status. */
+	writel(pending & mask, zuma_decon0.base + ZUMA_DECON_INT_PEND);
 	if (readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) & mask) {
 		zuma_drm_latch_irq_fault(zdev);
 		return IRQ_HANDLED;
 	}
 
-	atomic64_inc(counter);
-	if (!proof_armed)
+	if (!handler_live || !proof_armed) {
 		zuma_drm_latch_irq_fault(zdev);
+		return IRQ_HANDLED;
+	}
+	atomic64_inc(counter);
 	if (account_vblank && !drm_crtc_handle_vblank(&zdev->crtc))
 		zuma_drm_latch_irq_fault(zdev);
-	if (proof_armed)
-		complete(completion);
+	complete(completion);
 	return IRQ_HANDLED;
 }
 
@@ -947,6 +1329,66 @@ static irqreturn_t zuma_drm_frame_done_irq(int irq, void *data)
 	return zuma_drm_handle_frame_irq(zdev, ZUMA_DECON_INT_FRAME_DONE,
 					 &zdev->frame_done_irq_count,
 					 &zdev->frame_done_completion, false);
+}
+
+static void
+zuma_decon_capture_pending(struct zuma_drm *zdev, u32 main, u32 extra)
+{
+	WRITE_ONCE(zdev->decon_main_status, main);
+	WRITE_ONCE(zdev->decon_extra_status, extra);
+	if (!(main & ZUMA_DECON_INT_EXTRA) && !extra)
+		return;
+	WRITE_ONCE(zdev->decon_timeout_value,
+		   readl(zuma_decon0.base + ZUMA_DECON_INT_TIMEOUT_VAL));
+	WRITE_ONCE(zdev->decon_resource_status[0],
+		   readl(zuma_decon0.base + ZUMA_DECON_RSC_STATUS_0));
+	WRITE_ONCE(zdev->decon_resource_status[1],
+		   readl(zuma_decon0.base + ZUMA_DECON_RSC_STATUS_2));
+	WRITE_ONCE(zdev->decon_resource_status[2],
+		   readl(zuma_decon0.base + ZUMA_DECON_RSC_STATUS_4));
+	WRITE_ONCE(zdev->decon_resource_status[3],
+		   readl(zuma_decon0.base + ZUMA_DECON_RSC_STATUS_5));
+}
+
+static irqreturn_t zuma_drm_extra_irq(int irq, void *data)
+{
+	struct zuma_drm *zdev = data;
+	bool live = zuma_decon_irq_handler_live(zdev);
+	u32 extra;
+	u32 main;
+	bool bad = false;
+
+	main = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND);
+	if (!(main & ZUMA_DECON_INT_EXTRA)) {
+		if (zdev->irq_routes_enabled)
+			zuma_drm_latch_irq_fault(zdev);
+		return IRQ_NONE;
+	}
+
+	extra = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA);
+	zuma_decon_capture_pending(zdev, main, extra);
+
+	/* Both pending registers are W1C; never replay control values. */
+	if (extra & ZUMA_DECON_EXTRA_STATUS_MASK)
+		writel(extra & ZUMA_DECON_EXTRA_STATUS_MASK,
+		       zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA);
+	writel(main & ZUMA_DECON_INT_EXTRA,
+	       zuma_decon0.base + ZUMA_DECON_INT_PEND);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA) &
+	    ZUMA_DECON_EXTRA_STATUS_MASK)
+		bad = true;
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) &
+	    ZUMA_DECON_INT_EXTRA)
+		bad = true;
+	if (!live || !(extra & ZUMA_DECON_EXTRA_OWNED) ||
+	    (extra & ~ZUMA_DECON_EXTRA_OWNED) ||
+	    (main & (ZUMA_DECON_INT_DQE_START | ZUMA_DECON_INT_DQE_END)))
+		bad = true;
+
+	/* Resource conflict and timeout are fatal even after clean W1C. */
+	if (bad || (extra & ZUMA_DECON_EXTRA_OWNED))
+		zuma_drm_latch_irq_fault(zdev);
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t zuma_drm_dpp_dma_irq(int irq, void *data)
@@ -1086,9 +1528,11 @@ static int zuma_drm_setup_irqs(struct zuma_drm *zdev)
 	atomic_set(&zdev->dpp_dma_error_status, 0);
 	atomic_set(&zdev->dpp_core_error_status, 0);
 	INIT_WORK(&zdev->dpp_irq_fault_work, zuma_drm_dpp_irq_fault_work);
+	zuma_decon_set_irq_owner_state(zdev, ZUMA_DECON_IRQ_INHERITED);
 	zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_INHERITED);
 	zdev->frame_start_irq = -1;
 	zdev->frame_done_irq = -1;
+	zdev->extra_irq = -1;
 	zdev->dpp_dma_irq = -1;
 	zdev->dpp_core_irq = -1;
 
@@ -1098,12 +1542,17 @@ static int zuma_drm_setup_irqs(struct zuma_drm *zdev)
 
 	zdev->frame_start_irq = of_irq_get_byname(np, "frame_start");
 	zdev->frame_done_irq = of_irq_get_byname(np, "frame_done");
+	zdev->extra_irq = of_irq_get_byname(np, "extra");
 	of_node_put(np);
 	if (zdev->frame_start_irq < 0)
 		return zdev->frame_start_irq;
 	if (zdev->frame_done_irq < 0)
 		return zdev->frame_done_irq;
-	if (zdev->frame_start_irq == zdev->frame_done_irq)
+	if (zdev->extra_irq < 0)
+		return zdev->extra_irq;
+	if (zdev->frame_start_irq == zdev->frame_done_irq ||
+	    zdev->frame_start_irq == zdev->extra_irq ||
+	    zdev->frame_done_irq == zdev->extra_irq)
 		return -EINVAL;
 
 	ret = devm_request_irq(zuma_drm_root, zdev->frame_start_irq,
@@ -1115,6 +1564,12 @@ static int zuma_drm_setup_irqs(struct zuma_drm *zdev)
 	ret = devm_request_irq(zuma_drm_root, zdev->frame_done_irq,
 			       zuma_drm_frame_done_irq, IRQF_NO_AUTOEN,
 			       "zuma-decon-frame-done", zdev);
+	if (ret)
+		return ret;
+
+	ret = devm_request_irq(zuma_drm_root, zdev->extra_irq,
+			       zuma_drm_extra_irq, IRQF_NO_AUTOEN,
+			       "zuma-decon-extra", zdev);
 	if (ret)
 		return ret;
 
@@ -1131,8 +1586,10 @@ static int zuma_drm_setup_irqs(struct zuma_drm *zdev)
 	if (zdev->dpp_dma_irq == zdev->dpp_core_irq ||
 	    zdev->dpp_dma_irq == zdev->frame_start_irq ||
 	    zdev->dpp_dma_irq == zdev->frame_done_irq ||
+	    zdev->dpp_dma_irq == zdev->extra_irq ||
 	    zdev->dpp_core_irq == zdev->frame_start_irq ||
-	    zdev->dpp_core_irq == zdev->frame_done_irq)
+	    zdev->dpp_core_irq == zdev->frame_done_irq ||
+	    zdev->dpp_core_irq == zdev->extra_irq)
 		return -EINVAL;
 
 	ret = devm_request_irq(zuma_drm_root, zdev->dpp_dma_irq,
@@ -1146,8 +1603,8 @@ static int zuma_drm_setup_irqs(struct zuma_drm *zdev)
 	if (ret)
 		return ret;
 
-	pr_info("zuma-display-handoff: requested disabled DECON frame IRQs start=%d done=%d\n",
-		zdev->frame_start_irq, zdev->frame_done_irq);
+	pr_info("zuma-display-handoff: requested disabled DECON IRQs start=%d done=%d extra=%d\n",
+		zdev->frame_start_irq, zdev->frame_done_irq, zdev->extra_irq);
 	pr_info("zuma-display-handoff: requested disabled DPP0 IRQs dma=%d dpp=%d\n",
 		zdev->dpp_dma_irq, zdev->dpp_core_irq);
 	return 0;
@@ -1157,6 +1614,8 @@ static void zuma_drm_destroy_workqueue(void *data)
 {
 	destroy_workqueue(data);
 }
+
+static bool zuma_decon_observe_entry(struct zuma_drm *zdev, const char *tag);
 
 static int zuma_drm_register(void)
 {
@@ -1257,12 +1716,17 @@ static int zuma_drm_register(void)
 	ret = zuma_drm_setup_irqs(zdev);
 	if (ret)
 		goto err_unregister_root;
-	zdev->reboot_notifier.notifier_call = zuma_drm_reboot_notifier;
-	ret = devm_register_reboot_notifier(zuma_drm_root,
-					    &zdev->reboot_notifier);
+	mutex_lock(&zuma_display_mmio_lock);
+	ret = zuma_decon_observe_entry(zdev, "registration") ? 0 : -EIO;
+	mutex_unlock(&zuma_display_mmio_lock);
 	if (ret)
 		goto err_unregister_root;
 	ret = zuma_drm_enable_irq_routes(zdev);
+	if (ret)
+		goto err_unregister_root;
+	zdev->reboot_notifier.notifier_call = zuma_drm_reboot_notifier;
+	ret = devm_register_reboot_notifier(zuma_drm_root,
+					    &zdev->reboot_notifier);
 	if (ret)
 		goto err_unregister_root;
 	if (READ_ONCE(zuma_drm_update_failed)) {
@@ -1279,15 +1743,11 @@ static int zuma_drm_register(void)
 		goto err_disable_irq_routes;
 
 	zuma_drm_device = zdev;
-	pr_info("zuma-display-handoff: registered DRM-only fixed-mode shadow updates with persistent DPP IRQ lifecycle and ordered nonblocking flips\n");
+	pr_info("zuma-display-handoff: registered DRM-only fixed-mode shadow updates with resetless DECON0/DPP0 IRQ ownership and ordered nonblocking flips\n");
 	return 0;
 
 err_disable_irq_routes:
-	disable_irq_nosync(zdev->frame_done_irq);
-	disable_irq_nosync(zdev->frame_start_irq);
-	zdev->irq_routes_enabled = false;
-	synchronize_irq(zdev->frame_done_irq);
-	synchronize_irq(zdev->frame_start_irq);
+	zuma_decon_disable_irq_routes(zdev);
 err_unregister_root:
 	root_device_unregister(zuma_drm_root);
 	zuma_drm_root = NULL;
@@ -1339,6 +1799,56 @@ zuma_dpp0_dt_u32_matches(struct device_node *np, const char *name, u32 expected)
 	pr_info("zuma-display-handoff: R34 DPP0 DT %s=%#x length=%d\n",
 		name, value, length);
 	return true;
+}
+
+static bool __init zuma_decon0_dt_contract_valid(void)
+{
+	struct device_node *np;
+	struct resource res;
+	u32 interrupts[ARRAY_SIZE(zuma_decon0_irq_cells)];
+	const char *name;
+	resource_size_t size;
+	unsigned int i;
+	int count;
+	bool valid = false;
+
+	np = zuma_drm_find_decon_node();
+	if (!np)
+		return false;
+	count = of_property_count_strings(np, "reg-names");
+	if (count < ARRAY_SIZE(zuma_decon0_dt_resources))
+		goto out;
+	for (i = 0; i < ARRAY_SIZE(zuma_decon0_dt_resources); i++) {
+		if (of_property_read_string_index(np, "reg-names", i, &name) ||
+		    strcmp(name, zuma_decon0_dt_resources[i].name) ||
+		    of_address_to_resource(np, i, &res))
+			goto out;
+		size = resource_size(&res);
+		if (res.start != zuma_decon0_dt_resources[i].start ||
+		    size != zuma_decon0_dt_resources[i].size)
+			goto out;
+	}
+	count = of_property_count_strings(np, "interrupt-names");
+	if (count != ARRAY_SIZE(zuma_decon0_irq_names))
+		goto out;
+	for (i = 0; i < ARRAY_SIZE(zuma_decon0_irq_names); i++) {
+		if (of_property_read_string_index(np, "interrupt-names", i,
+						  &name) ||
+		    strcmp(name, zuma_decon0_irq_names[i]))
+			goto out;
+	}
+	if (of_property_count_u32_elems(np, "interrupts") !=
+	    ARRAY_SIZE(zuma_decon0_irq_cells) ||
+	    of_property_read_u32_array(np, "interrupts", interrupts,
+				       ARRAY_SIZE(interrupts)) ||
+	    memcmp(interrupts, zuma_decon0_irq_cells, sizeof(interrupts)))
+		goto out;
+	valid = true;
+out:
+	of_node_put(np);
+	if (!valid)
+		pr_err("zuma-display-handoff: exact stock DECON0 DT contract mismatch\n");
+	return valid;
 }
 
 static bool __init zuma_dpp0_dt_contract_valid(void)
@@ -1576,10 +2086,316 @@ static bool zuma_display_domains_on(u32 *dpub, u32 *dpuf0, u32 *dpuf1)
 	return (*dpub & ZUMA_PD_ON) && (*dpuf0 & ZUMA_PD_ON);
 }
 
+static void __iomem *
+zuma_decon_profile_base(enum zuma_decon_entry_region region)
+{
+	switch (region) {
+	case ZUMA_DECON_PROFILE_MAIN:
+		return zuma_decon0.base;
+	case ZUMA_DECON_PROFILE_WIN:
+		return zuma_decon0_win.base;
+	case ZUMA_DECON_PROFILE_WINCON:
+		return zuma_decon0_wincon.base;
+	}
+	return NULL;
+}
+
+static bool zuma_decon_entry_profile_ready(const char *tag, bool shadow)
+{
+	const struct zuma_decon_entry_reg *reg;
+	void __iomem *base;
+	u32 actual;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(zuma_decon_entry_profile); i++) {
+		reg = &zuma_decon_entry_profile[i];
+		base = zuma_decon_profile_base(reg->region);
+		actual = readl(base + reg->live);
+		if ((actual & reg->mask) != reg->value) {
+			pr_err("zuma-display-handoff: DECON0 %s %s live=%#x expected=%#x mask=%#x\n",
+			       tag, reg->name, actual, reg->value, reg->mask);
+			return false;
+		}
+		if (!shadow || reg->shadow == ZUMA_DECON_NO_SHADOW)
+			continue;
+		actual = readl(base + reg->shadow);
+		if ((actual & reg->mask) != reg->value) {
+			pr_err("zuma-display-handoff: DECON0 %s %s shadow=%#x expected=%#x mask=%#x\n",
+			       tag, reg->name, actual, reg->value, reg->mask);
+			return false;
+		}
+	}
+
+	for (i = 0; i < ZUMA_DECON_WINDOW_COUNT; i++) {
+		if (i == ZUMA_DECON_ACTIVE_WINDOW)
+			continue;
+		actual = readl(zuma_decon0_wincon.base +
+			       i * ZUMA_DECON_WIN_STRIDE);
+		if (actual & ZUMA_DECON_WINCON_ENABLE) {
+			pr_err("zuma-display-handoff: DECON0 %s window=%u live-control=%#x enabled\n",
+			       tag, i, actual);
+			return false;
+		}
+		if (!shadow)
+			continue;
+		actual = readl(zuma_decon0_wincon.base +
+			       i * ZUMA_DECON_WIN_STRIDE +
+			       ZUMA_DECON_SHADOW_OFFSET);
+		if (actual & ZUMA_DECON_WINCON_ENABLE) {
+			pr_err("zuma-display-handoff: DECON0 %s window=%u shadow-control=%#x enabled\n",
+			       tag, i, actual);
+			return false;
+		}
+	}
+	return true;
+}
+
+static void zuma_decon_log_preserved_profile(const char *tag)
+{
+	u32 win = ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE;
+
+	pr_info("zuma-display-handoff: DECON0 %s core global=%#x/%#x trigger=%#x path=%#x/%#x background=%#x/%#x\n",
+		tag,
+		readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON),
+		readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON),
+		readl(zuma_decon0.base + ZUMA_DECON_DATA_PATH_CON_0),
+		readl(zuma_decon0.base + ZUMA_DECON_DATA_PATH_CON_0 +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_BG_SIZE),
+		readl(zuma_decon0.base + ZUMA_DECON_BG_SIZE +
+		      ZUMA_DECON_SHADOW_OFFSET));
+	pr_info("zuma-display-handoff: DECON0 %s output size0=%#x/%#x size1=%#x/%#x size2=%#x/%#x threshold=%#x/%#x order=%#x/%#x\n",
+		tag,
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_0),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_0 +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1 +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2 +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_THRESHOLD),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_THRESHOLD +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_PIXEL_ORDER),
+		readl(zuma_decon0.base + ZUMA_DECON_OF_PIXEL_ORDER +
+		      ZUMA_DECON_SHADOW_OFFSET));
+	pr_info("zuma-display-handoff: DECON0 %s window5 live=%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x shadow=%#x/%#x/%#x/%#x/%#x/%#x/%#x/%#x\n",
+		tag,
+		readl(zuma_decon0_win.base + win + 0x00),
+		readl(zuma_decon0_win.base + win + 0x04),
+		readl(zuma_decon0_win.base + win + 0x08),
+		readl(zuma_decon0_win.base + win + 0x0c),
+		readl(zuma_decon0_win.base + win + 0x10),
+		readl(zuma_decon0_win.base + win + 0x14),
+		readl(zuma_decon0_win.base + win + 0x18),
+		readl(zuma_decon0_win.base + win + 0x1c),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x00),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x04),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x08),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x0c),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x10),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x14),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x18),
+		readl(zuma_decon0_win.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET + 0x1c));
+	pr_info("zuma-display-handoff: DECON0 %s window5 function=%#x/%#x,%#x/%#x position=%#x/%#x-%#x/%#x control=%#x/%#x DSIMIF=%#x/%#x,%#x/%#x DSC0/1=%#x/%#x,%#x/%#x\n",
+		tag,
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_FUNC_0),
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_FUNC_0 +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_FUNC_1),
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_FUNC_1 +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_START),
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_START +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_END),
+		readl(zuma_decon0_win.base + win + ZUMA_DECON_WIN_END +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_wincon.base + win),
+		readl(zuma_decon0_wincon.base + win +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSIMIF0_SEL),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSIMIF0_SEL +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSIMIF1_SEL),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSIMIF1_SEL +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSC0_CONTROL1),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSC0_CONTROL1 +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSC1_CONTROL1),
+		readl(zuma_decon0_sub.base + ZUMA_DECON_SUB_DSC1_CONTROL1 +
+		      ZUMA_DECON_SHADOW_OFFSET));
+}
+
+static int zuma_decon_capture_protected(struct zuma_drm *zdev)
+{
+	struct zuma_decon_protected_state *saved = &zdev->decon_protected;
+	const struct zuma_decon_entry_reg *reg;
+	void __iomem *base;
+	u32 offset;
+	unsigned int block;
+	unsigned int i;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	zdev->decon_protected_valid = false;
+	for (i = 0; i < ARRAY_SIZE(zuma_decon_entry_profile); i++) {
+		reg = &zuma_decon_entry_profile[i];
+		base = zuma_decon_profile_base(reg->region);
+		saved->profile_live[i] = readl(base + reg->live);
+		saved->profile_shadow[i] = reg->shadow == ZUMA_DECON_NO_SHADOW ?
+			0 : readl(base + reg->shadow);
+	}
+
+	base = zuma_decon0_win.base +
+		ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE;
+	for (i = 0; i < ZUMA_DECON_WINDOW_WORD_COUNT; i++) {
+		saved->window_live[i] = readl(base + i * sizeof(u32));
+		saved->window_shadow[i] =
+			readl(base + ZUMA_DECON_SHADOW_OFFSET +
+			      i * sizeof(u32));
+		if (saved->window_live[i] != saved->window_shadow[i])
+			return -EIO;
+	}
+	base = zuma_decon0_wincon.base +
+		ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE;
+	saved->window_control = readl(base);
+	saved->window_control_shadow =
+		readl(base + ZUMA_DECON_SHADOW_OFFSET);
+	if (saved->window_control != saved->window_control_shadow)
+		return -EIO;
+
+	saved->of_size_1[0] =
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1);
+	saved->of_size_1[1] =
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1 +
+		      ZUMA_DECON_SHADOW_OFFSET);
+	saved->of_size_2[0] =
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2);
+	saved->of_size_2[1] =
+		readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2 +
+		      ZUMA_DECON_SHADOW_OFFSET);
+	for (block = 0; block < ZUMA_DECON_DSIMIF_COUNT; block++) {
+		base = zuma_decon0_sub.base + ZUMA_DECON_SUB_DSIMIF0_SEL +
+			block * ZUMA_DECON_WIN_STRIDE;
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsimif_offsets); i++) {
+			offset = zuma_decon_dsimif_offsets[i];
+			saved->dsimif[block][i][0] = readl(base + offset);
+			saved->dsimif[block][i][1] =
+				readl(base + offset + ZUMA_DECON_SHADOW_OFFSET);
+			if (saved->dsimif[block][i][0] !=
+			    saved->dsimif[block][i][1])
+				return -EIO;
+		}
+	}
+	if (saved->dsimif[0][0][0] || saved->dsimif[1][0][0] != 0xf)
+		return -EIO;
+
+	for (block = 0; block < ZUMA_DECON_DSC_COUNT; block++) {
+		base = zuma_decon0_sub.base +
+			block * ZUMA_DECON_WIN_STRIDE;
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsc_offsets); i++) {
+			offset = zuma_decon_dsc_offsets[i];
+			saved->dsc[block][i][0] = readl(base + offset);
+			saved->dsc[block][i][1] =
+				readl(base + offset + ZUMA_DECON_SHADOW_OFFSET);
+		}
+	}
+	saved->timeout_value =
+		readl(zuma_decon0.base + ZUMA_DECON_INT_TIMEOUT_VAL);
+	if (saved->timeout_value != U32_MAX)
+		return -EIO;
+	zdev->decon_protected_valid = true;
+	return 0;
+}
+
+static bool zuma_decon_protected_ready(struct zuma_drm *zdev)
+{
+	struct zuma_decon_protected_state *saved = &zdev->decon_protected;
+	const struct zuma_decon_entry_reg *reg;
+	void __iomem *base;
+	u32 offset;
+	unsigned int block;
+	unsigned int i;
+
+	if (!zdev->decon_protected_valid ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_TIMEOUT_VAL) !=
+		saved->timeout_value)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(zuma_decon_entry_profile); i++) {
+		reg = &zuma_decon_entry_profile[i];
+		base = zuma_decon_profile_base(reg->region);
+		if (readl(base + reg->live) != saved->profile_live[i])
+			return false;
+		if (reg->shadow != ZUMA_DECON_NO_SHADOW &&
+		    readl(base + reg->shadow) != saved->profile_shadow[i])
+			return false;
+	}
+
+	base = zuma_decon0_win.base +
+		ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE;
+	for (i = 0; i < ZUMA_DECON_WINDOW_WORD_COUNT; i++) {
+		if (readl(base + i * sizeof(u32)) != saved->window_live[i] ||
+		    readl(base + ZUMA_DECON_SHADOW_OFFSET +
+			  i * sizeof(u32)) != saved->window_shadow[i])
+			return false;
+	}
+	base = zuma_decon0_wincon.base +
+		ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE;
+	if (readl(base) != saved->window_control ||
+	    readl(base + ZUMA_DECON_SHADOW_OFFSET) !=
+		saved->window_control_shadow ||
+	    readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1) !=
+		saved->of_size_1[0] ||
+	    readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1 +
+		  ZUMA_DECON_SHADOW_OFFSET) != saved->of_size_1[1] ||
+	    readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2) !=
+		saved->of_size_2[0] ||
+	    readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2 +
+		  ZUMA_DECON_SHADOW_OFFSET) != saved->of_size_2[1])
+		return false;
+
+	for (block = 0; block < ZUMA_DECON_DSIMIF_COUNT; block++) {
+		base = zuma_decon0_sub.base + ZUMA_DECON_SUB_DSIMIF0_SEL +
+			block * ZUMA_DECON_WIN_STRIDE;
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsimif_offsets); i++) {
+			offset = zuma_decon_dsimif_offsets[i];
+			if (readl(base + offset) != saved->dsimif[block][i][0] ||
+			    readl(base + offset + ZUMA_DECON_SHADOW_OFFSET) !=
+				saved->dsimif[block][i][1])
+				return false;
+		}
+	}
+	for (block = 0; block < ZUMA_DECON_DSC_COUNT; block++) {
+		base = zuma_decon0_sub.base +
+			block * ZUMA_DECON_WIN_STRIDE;
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsc_offsets); i++) {
+			offset = zuma_decon_dsc_offsets[i];
+			if (readl(base + offset) != saved->dsc[block][i][0] ||
+			    readl(base + offset + ZUMA_DECON_SHADOW_OFFSET) !=
+				saved->dsc[block][i][1])
+				return false;
+		}
+	}
+	return true;
+}
+
 static u32 zuma_decon_wincon_read(unsigned int window)
 {
 	return readl(zuma_decon0_wincon.base +
-		     window * ZUMA_DECON_WINCON_STRIDE);
+		     window * ZUMA_DECON_WIN_STRIDE);
 }
 
 static bool zuma_display_active_window_valid(void)
@@ -2327,19 +3143,38 @@ static void zuma_drm_dpp_irq_fault_work(struct work_struct *work)
 {
 	struct zuma_drm *zdev =
 		container_of(work, struct zuma_drm, dpp_irq_fault_work);
-	int ret;
+	u32 extra_en;
+	u32 int_en;
+	int decon_ret;
+	int dpp_ret;
 
 	mutex_lock(&zuma_display_mmio_lock);
-	zuma_display_set_hw_trigger(false);
-	ret = zuma_dpp0_irq_restore(zdev);
+	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
+	extra_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
+	if (zuma_decon_irq_owner_state(zdev) == ZUMA_DECON_IRQ_SHUTDOWN) {
+		decon_ret = 0;
+		dpp_ret = 0;
+	} else {
+		decon_ret = zuma_decon_fail_quiesce(zdev);
+		dpp_ret = zuma_dpp0_irq_restore(zdev);
+	}
 	mutex_unlock(&zuma_display_mmio_lock);
-	pr_err("zuma-display-handoff: DRM fault cleanup dma-status=%#x dma-errors=%#x dma-config=%#x dpp-status=%#x dpp-errors=%#x dpp-config=%#x restore=%s\n",
+	pr_err("zuma-display-handoff: DRM fault cleanup decon-main=%#x decon-leaf=%#x decon-status=%#x extra-status=%#x timeout=%#x rsc=%#x/%#x/%#x/%#x decon=%s dma-status=%#x dma-errors=%#x dma-config=%#x dpp-status=%#x dpp-errors=%#x dpp-config=%#x dpp=%s\n",
+	       int_en, extra_en, READ_ONCE(zdev->decon_main_status),
+	       READ_ONCE(zdev->decon_extra_status),
+	       READ_ONCE(zdev->decon_timeout_value),
+	       READ_ONCE(zdev->decon_resource_status[0]),
+	       READ_ONCE(zdev->decon_resource_status[1]),
+	       READ_ONCE(zdev->decon_resource_status[2]),
+	       READ_ONCE(zdev->decon_resource_status[3]),
+	       decon_ret ? "failed" : "ok",
 	       READ_ONCE(zdev->dpp_dma_status),
 	       atomic_read(&zdev->dpp_dma_error_status),
 	       READ_ONCE(zdev->dpp_dma_config_error),
 	       READ_ONCE(zdev->dpp_core_status),
 	       atomic_read(&zdev->dpp_core_error_status),
-	       READ_ONCE(zdev->dpp_core_config_error), ret ? "failed" : "ok");
+	       READ_ONCE(zdev->dpp_core_config_error),
+	       dpp_ret ? "failed" : "ok");
 }
 
 static int
@@ -2465,6 +3300,13 @@ static void zuma_display_snapshot(const char *label)
 		label, ZUMA_DECON_ACTIVE_WINDOW,
 		zuma_decon_wincon_read(ZUMA_DECON_ACTIVE_WINDOW),
 		readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ));
+	pr_info("zuma-display-handoff: %s DECON IRQ main=%#x leaf=%#x pending=%#x/%#x timeout=%#x\n",
+		label,
+		readl(zuma_decon0.base + ZUMA_DECON_INT_EN),
+		readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA),
+		readl(zuma_decon0.base + ZUMA_DECON_INT_PEND),
+		readl(zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA),
+		readl(zuma_decon0.base + ZUMA_DECON_INT_TIMEOUT_VAL));
 
 	rdma_ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0);
 	rdma_shadow_ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0 +
@@ -2710,9 +3552,20 @@ static int zuma_display_trigger_frame(u32 *frame_before, u32 *frame_after)
 static bool zuma_display_update_ready_for_ctrl(u32 ctrl, u32 shadow_ctrl,
 					       u32 int_en)
 {
+	enum zuma_decon_irq_owner_state state = ZUMA_DECON_IRQ_INHERITED;
 	u32 dpub, dpuf0, dpuf1;
 
-	if (!zuma_display_domains_on(&dpub, &dpuf0, &dpuf1))
+	if (!zuma_display_domains_on(&dpub, &dpuf0, &dpuf1) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN) != int_en)
+		return false;
+	if (zuma_drm_device)
+		state = zuma_decon_irq_owner_state(zuma_drm_device);
+	if ((state == ZUMA_DECON_IRQ_ACQUIRING ||
+	     state == ZUMA_DECON_IRQ_OWNED) &&
+	    (!zuma_decon_entry_profile_ready("update-ready", true) ||
+	     !zuma_decon_protected_ready(zuma_drm_device) ||
+	     readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+		ZUMA_DECON_EXTRA_OWNED))
 		return false;
 
 	return readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON) ==
@@ -2720,7 +3573,6 @@ static bool zuma_display_update_ready_for_ctrl(u32 ctrl, u32 shadow_ctrl,
 	       readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) ==
 			ZUMA_DECON_TRIG_EXPECTED &&
 	       !readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ) &&
-	       readl(zuma_decon0.base + ZUMA_DECON_INT_EN) == int_en &&
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) ==
 			ZUMA_DPP_RDMA_EXPECTED &&
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IN_CTRL_0) == ctrl &&
@@ -2741,7 +3593,7 @@ static bool zuma_display_update_ready(void)
 {
 	return zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
 						  zuma_framebuffer_ctrl,
-						  ZUMA_DECON_INT_QUIESCENT);
+						  ZUMA_DECON_INT_INHERITED_QUIESCENT);
 }
 
 static bool zuma_dpp0_resetless_preflight_ready(struct zuma_drm *zdev)
@@ -2762,94 +3614,596 @@ static bool zuma_dpp0_resetless_preflight_ready(struct zuma_drm *zdev)
 
 static bool zuma_drm_scanout_update_ready(void)
 {
-	return zuma_boot_buffer && zuma_scanout_buffer &&
-	       zuma_framebuffer_phys == ZUMA_SCANOUT_FB_BASE &&
-	       !READ_ONCE(zuma_drm_update_failed) &&
-	       zuma_dpp0_resetless_preflight_ready(zuma_drm_device) &&
-	       (zuma_display_update_ready() ||
-		zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
-						   zuma_framebuffer_ctrl,
-						   ZUMA_DECON_INT_ACTIVE));
+	struct zuma_drm *zdev = zuma_drm_device;
+	enum zuma_decon_irq_owner_state state;
+	u32 active;
+	u32 quiescent;
+	bool common;
+
+	if (!zdev || !zuma_decon_pending_zero(zdev))
+		return false;
+	state = zuma_decon_irq_owner_state(zdev);
+	quiescent = zuma_decon_int_quiescent(zdev);
+	active = zuma_decon_int_active(zdev);
+	common = quiescent && zuma_boot_buffer && zuma_scanout_buffer &&
+		 zuma_framebuffer_phys == ZUMA_SCANOUT_FB_BASE &&
+		 !READ_ONCE(zuma_drm_update_failed) &&
+		 zuma_dpp0_resetless_preflight_ready(zdev);
+	if (!common)
+		return false;
+	if (state == ZUMA_DECON_IRQ_INHERITED)
+		return zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
+						  zuma_framebuffer_ctrl,
+						  quiescent);
+	if (state != ZUMA_DECON_IRQ_OWNED)
+		return false;
+	if (zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
+					       zuma_framebuffer_ctrl,
+					       quiescent))
+		return true;
+	return zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
+						  zuma_framebuffer_ctrl, active);
 }
 
-static int zuma_drm_clear_frame_pending(bool allow_stale)
+static bool zuma_decon_pending_zero(struct zuma_drm *zdev)
 {
-	u32 pending;
+	u32 extra = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA) &
+		ZUMA_DECON_EXTRA_STATUS_MASK;
+	u32 main = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) &
+		ZUMA_DECON_INT_STATUS_MASK;
 
-	pending = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) &
-		ZUMA_DECON_INT_FRAME_MASK;
-	if (pending)
-		writel(pending, zuma_decon0.base + ZUMA_DECON_INT_PEND);
-	if (readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) &
-	    ZUMA_DECON_INT_FRAME_MASK)
+	if (main || extra) {
+		zuma_decon_capture_pending(zdev, main, extra);
+		return false;
+	}
+	return true;
+}
+
+static int zuma_drm_clear_pending(struct zuma_drm *zdev, bool allow_stale)
+{
+	u32 extra;
+	u32 main;
+
+	/* Inherited state is observation-only; W1C starts with ownership. */
+	if (zuma_decon_irq_owner_state(zdev) == ZUMA_DECON_IRQ_INHERITED)
+		return -EPERM;
+	main = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) &
+		ZUMA_DECON_INT_STATUS_MASK;
+	extra = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA) &
+		ZUMA_DECON_EXTRA_STATUS_MASK;
+	if (main || extra)
+		zuma_decon_capture_pending(zdev, main, extra);
+	/* Leaf and summary/status registers are W1C. */
+	if (extra)
+		writel(extra, zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA);
+	if (main)
+		writel(main, zuma_decon0.base + ZUMA_DECON_INT_PEND);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA) &
+	    ZUMA_DECON_EXTRA_STATUS_MASK)
 		return -EIO;
-	if (pending && !allow_stale)
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_PEND) &
+	    ZUMA_DECON_INT_STATUS_MASK)
+		return -EIO;
+	if ((main & ~ZUMA_DECON_INT_FRAME_MASK) || extra)
+		return -EIO;
+	if ((main & ZUMA_DECON_INT_FRAME_MASK) && !allow_stale)
 		return -EIO;
 	return 0;
 }
 
+struct zuma_entry_control_reg {
+	const char *name;
+	struct zuma_display_block *block;
+	u16 offset;
+};
+
+/* Only registers already read by the inherited-entry path. */
+static const struct zuma_entry_control_reg zuma_entry_controls[] = {
+	{ "frame", &zuma_decon0, ZUMA_DECON_FRAME_COUNT },
+	{ "global", &zuma_decon0, ZUMA_DECON_GLOBAL_CON },
+	{ "trigger", &zuma_decon0, ZUMA_DECON_TRIG_CON },
+	{ "request", &zuma_decon0, ZUMA_DECON_SHD_REG_UP_REQ },
+	{ "main-enable", &zuma_decon0, ZUMA_DECON_INT_EN },
+	{ "extra-enable", &zuma_decon0, ZUMA_DECON_INT_EN_EXTRA },
+	{ "main-pending", &zuma_decon0, ZUMA_DECON_INT_PEND },
+	{ "extra-pending", &zuma_decon0, ZUMA_DECON_INT_PEND_EXTRA },
+	{ "timeout", &zuma_decon0, ZUMA_DECON_INT_TIMEOUT_VAL },
+	{ "rdma-enable", &zuma_dpp0, ZUMA_DPP_RDMA_ENABLE },
+	{ "rdma-irq", &zuma_dpp0, ZUMA_DPP_RDMA_IRQ },
+	{ "dpp-reset", &zuma_dpp0_dpp, ZUMA_DPP_CORE_SWRST },
+	{ "dpp-enable", &zuma_dpp0_dpp, ZUMA_DPP_CORE_IRQ_CON },
+	{ "dpp-mask", &zuma_dpp0_dpp, ZUMA_DPP_CORE_IRQ_MASK },
+	{ "dpp-pending", &zuma_dpp0_dpp, ZUMA_DPP_CORE_IRQ_STATUS },
+	{ "dpp-config", &zuma_dpp0_dpp, ZUMA_DPP_CORE_CONFIG_ERROR },
+	{ "dpp-op", &zuma_dpp0_dpp, ZUMA_DPP_CORE_OP_STATUS },
+	{ "dsim-link", &zuma_dsim0, ZUMA_DSIM_LINK_STATUS1 },
+	{ "dsim-mipi", &zuma_dsim0, ZUMA_DSIM_MIPI_STATUS },
+};
+
+struct zuma_entry_snapshot {
+	struct zuma_decon_protected_state decon;
+	u32 controls[2][ARRAY_SIZE(zuma_entry_controls)];
+	u32 wincon[ZUMA_DECON_WINDOW_COUNT][2];
+	u32 dpp[ARRAY_SIZE(zuma_dpp0_fixed_profile)][2];
+};
+
+static void zuma_decon_read_entry_controls(u32 *values)
+{
+	const struct zuma_entry_control_reg *reg;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(zuma_entry_controls); i++) {
+		reg = &zuma_entry_controls[i];
+		values[i] = readl(reg->block->base + reg->offset);
+	}
+}
+
+static bool zuma_decon_log_entry_reg(const char *tag, const char *name,
+				     unsigned int region, u16 offset,
+				     const char *bank, u32 value,
+				     u32 mask, u32 expected)
+{
+	bool match = (value & mask) == expected;
+
+	pr_info("zuma-display-handoff: R43 %s %s region=%u %s[%#x]=%#x mask=%#x expected=%#x match=%s\n",
+		tag, name, region, bank, offset, value, mask, expected,
+		match ? "yes" : "no");
+	return match;
+}
+
+/*
+ * Capture without validation exits or printing between the control brackets.
+ * This diagnostic has no ownership or protected-baseline side effects. A stable
+ * sample does not imply profile acceptance; the original gates still decide.
+ */
+static bool zuma_decon_observe_entry(struct zuma_drm *zdev, const char *tag)
+{
+	struct zuma_entry_snapshot snapshot = {};
+	struct zuma_decon_protected_state *s = &snapshot.decon;
+	const struct zuma_decon_entry_reg *reg;
+	const struct zuma_dpp0_profile_reg *dpp;
+	const struct zuma_entry_control_reg *control;
+	void __iomem *base;
+	u32 expected;
+	u32 offset;
+	u32 dpub, dpuf0, dpuf1;
+	unsigned int mismatches = 0;
+	unsigned int block;
+	unsigned int i;
+	bool stable;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (zuma_decon_irq_owner_state(zdev) != ZUMA_DECON_IRQ_INHERITED ||
+	    zdev->irq_routes_enabled || zdev->dpp_irq_routes_enabled ||
+	    !zuma_display_domains_on(&dpub, &dpuf0, &dpuf1)) {
+		pr_err("zuma-display-handoff: R43 %s observation unavailable: ownership/routes/domains\n",
+		       tag);
+		return false;
+	}
+
+	zuma_decon_read_entry_controls(snapshot.controls[0]);
+	for (i = 0; i < ARRAY_SIZE(zuma_decon_entry_profile); i++) {
+		reg = &zuma_decon_entry_profile[i];
+		base = zuma_decon_profile_base(reg->region);
+		s->profile_live[i] = readl(base + reg->live);
+		if (reg->shadow != ZUMA_DECON_NO_SHADOW)
+			s->profile_shadow[i] = readl(base + reg->shadow);
+	}
+	base = zuma_decon0_win.base +
+		ZUMA_DECON_ACTIVE_WINDOW * ZUMA_DECON_WIN_STRIDE;
+	for (i = 0; i < ZUMA_DECON_WINDOW_WORD_COUNT; i++) {
+		s->window_live[i] = readl(base + i * sizeof(u32));
+		s->window_shadow[i] = readl(base + ZUMA_DECON_SHADOW_OFFSET +
+					  i * sizeof(u32));
+	}
+	for (i = 0; i < ZUMA_DECON_WINDOW_COUNT; i++) {
+		base = zuma_decon0_wincon.base + i * ZUMA_DECON_WIN_STRIDE;
+		snapshot.wincon[i][0] = readl(base);
+		snapshot.wincon[i][1] = readl(base + ZUMA_DECON_SHADOW_OFFSET);
+	}
+	s->of_size_1[0] = readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1);
+	s->of_size_1[1] = readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_1 +
+			       ZUMA_DECON_SHADOW_OFFSET);
+	s->of_size_2[0] = readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2);
+	s->of_size_2[1] = readl(zuma_decon0.base + ZUMA_DECON_OF_SIZE_2 +
+			       ZUMA_DECON_SHADOW_OFFSET);
+	for (block = 0; block < ZUMA_DECON_DSIMIF_COUNT; block++) {
+		base = zuma_decon0_sub.base + ZUMA_DECON_SUB_DSIMIF0_SEL +
+			block * ZUMA_DECON_WIN_STRIDE;
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsimif_offsets); i++) {
+			offset = zuma_decon_dsimif_offsets[i];
+			s->dsimif[block][i][0] = readl(base + offset);
+			s->dsimif[block][i][1] =
+				readl(base + offset + ZUMA_DECON_SHADOW_OFFSET);
+		}
+	}
+	for (block = 0; block < ZUMA_DECON_DSC_COUNT; block++) {
+		base = zuma_decon0_sub.base + block * ZUMA_DECON_WIN_STRIDE;
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsc_offsets); i++) {
+			offset = zuma_decon_dsc_offsets[i];
+			s->dsc[block][i][0] = readl(base + offset);
+			s->dsc[block][i][1] =
+				readl(base + offset + ZUMA_DECON_SHADOW_OFFSET);
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(zuma_dpp0_fixed_profile); i++) {
+		dpp = &zuma_dpp0_fixed_profile[i];
+		base = zuma_dpp0_replay_base(dpp->region);
+		snapshot.dpp[i][0] = readl(base + dpp->live);
+		if (dpp->shadow != ZUMA_DPP0_NO_SHADOW)
+			snapshot.dpp[i][1] = readl(base + dpp->shadow);
+	}
+	zuma_decon_read_entry_controls(snapshot.controls[1]);
+	stable = !memcmp(snapshot.controls[0], snapshot.controls[1],
+			 sizeof(snapshot.controls[0]));
+
+	pr_info("zuma-display-handoff: R43 %s observation begin owner=%u dpp-owner=%u replay=%u routes=%u/%u controls-stable=%s read-only=yes\n",
+		tag, zuma_decon_irq_owner_state(zdev),
+		zuma_dpp0_irq_owner_state(zdev), zdev->replay_stage,
+		zdev->irq_routes_enabled, zdev->dpp_irq_routes_enabled,
+		stable ? "yes" : "no");
+	for (i = 0; i < ARRAY_SIZE(zuma_entry_controls); i++) {
+		control = &zuma_entry_controls[i];
+		pr_info("zuma-display-handoff: R43 %s control %s %s[%#x]=%#x->%#x\n",
+			tag, control->block->name, control->name, control->offset,
+			snapshot.controls[0][i], snapshot.controls[1][i]);
+	}
+	for (i = 0; i < ARRAY_SIZE(zuma_decon_entry_profile); i++) {
+		reg = &zuma_decon_entry_profile[i];
+		mismatches += !zuma_decon_log_entry_reg(tag, reg->name,
+			reg->region, reg->live, "live", s->profile_live[i],
+			reg->mask, reg->value);
+		if (reg->shadow != ZUMA_DECON_NO_SHADOW)
+			mismatches += !zuma_decon_log_entry_reg(tag, reg->name,
+				reg->region, reg->shadow, "shadow",
+				s->profile_shadow[i], reg->mask, reg->value);
+	}
+	for (i = 0; i < ZUMA_DECON_WINDOW_COUNT; i++) {
+		expected = i == ZUMA_DECON_ACTIVE_WINDOW ?
+			ZUMA_DECON_WINCON_EXPECTED : 0;
+		offset = i * ZUMA_DECON_WIN_STRIDE;
+		for (block = 0; block < 2; block++)
+			mismatches += !zuma_decon_log_entry_reg(tag, "wincon",
+				ZUMA_DECON_PROFILE_WINCON,
+				offset + block * ZUMA_DECON_SHADOW_OFFSET,
+				block ? "shadow" : "live", snapshot.wincon[i][block],
+				i == ZUMA_DECON_ACTIVE_WINDOW ? U32_MAX :
+				ZUMA_DECON_WINCON_ENABLE, expected);
+	}
+	for (i = 0; i < ZUMA_DECON_WINDOW_WORD_COUNT; i++)
+		pr_info("zuma-display-handoff: R43 %s WIN5[%#x] live=%#x shadow=%#x equal=%s\n",
+			tag, (u32)(i * sizeof(u32)), s->window_live[i],
+			s->window_shadow[i],
+			s->window_live[i] == s->window_shadow[i] ? "yes" : "no");
+	pr_info("zuma-display-handoff: R43 %s preserved OF_SIZE1=%#x/%#x OF_SIZE2=%#x/%#x\n",
+		tag, s->of_size_1[0], s->of_size_1[1],
+		s->of_size_2[0], s->of_size_2[1]);
+	for (block = 0; block < ZUMA_DECON_DSIMIF_COUNT; block++) {
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsimif_offsets); i++)
+			pr_info("zuma-display-handoff: R43 %s DSIMIF%u[%#x] live=%#x shadow=%#x equal=%s\n",
+				tag, block, zuma_decon_dsimif_offsets[i],
+				s->dsimif[block][i][0], s->dsimif[block][i][1],
+				s->dsimif[block][i][0] ==
+				s->dsimif[block][i][1] ? "yes" : "no");
+	}
+	for (block = 0; block < ZUMA_DECON_DSC_COUNT; block++) {
+		for (i = 0; i < ARRAY_SIZE(zuma_decon_dsc_offsets); i++)
+			pr_info("zuma-display-handoff: R43 %s preserved DSC%u[%#x] live=%#x shadow=%#x\n",
+				tag, block, zuma_decon_dsc_offsets[i],
+				s->dsc[block][i][0], s->dsc[block][i][1]);
+	}
+	for (i = 0; i < ARRAY_SIZE(zuma_dpp0_fixed_profile); i++) {
+		dpp = &zuma_dpp0_fixed_profile[i];
+		expected = dpp->value;
+		if (dpp->region == ZUMA_DPP0_REPLAY_DPP &&
+		    dpp->live == ZUMA_DPP_CORE_IO_CON)
+			expected = ZUMA_DPP_CORE_INHERITED_IO;
+		mismatches += !zuma_decon_log_entry_reg(tag, dpp->name,
+			dpp->region, dpp->live, "dpp-live", snapshot.dpp[i][0],
+			U32_MAX, expected);
+		if (dpp->shadow != ZUMA_DPP0_NO_SHADOW)
+			mismatches += !zuma_decon_log_entry_reg(tag, dpp->name,
+				dpp->region, dpp->shadow, "dpp-shadow",
+				snapshot.dpp[i][1], U32_MAX, expected);
+	}
+	pr_info("zuma-display-handoff: R43 %s observation end profile-mismatches=%u controls-stable=%s acceptance=not-evaluated\n",
+		tag, mismatches, stable ? "yes" : "no");
+	return stable;
+}
+
+/* Owned configuration only; functional entry-profile words are never written. */
+static int zuma_decon_configure_owned_irqs(struct zuma_drm *zdev)
+{
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (zuma_decon_irq_owner_state(zdev) != ZUMA_DECON_IRQ_ACQUIRING ||
+	    zdev->irq_routes_enabled || !zdev->decon_protected_valid)
+		return -EIO;
+
+	writel(ZUMA_DECON_EXTRA_OWNED,
+	       zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+	    ZUMA_DECON_EXTRA_OWNED)
+		return -EIO;
+	writel(ZUMA_DECON_INT_OWNED_QUIESCENT,
+	       zuma_decon0.base + ZUMA_DECON_INT_EN);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+	    ZUMA_DECON_INT_OWNED_QUIESCENT ||
+	    !zuma_decon_pending_zero(zdev))
+		return -EIO;
+	return zuma_decon_enable_owned_irq_routes(zdev);
+}
+
+static int
+zuma_decon_acquire_irq_ownership(struct zuma_drm *zdev, bool *acquisition_started)
+{
+	u32 extra_en;
+	u32 frame;
+	int ret;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	*acquisition_started = false;
+	if (!zuma_decon_observe_entry(zdev, "entry"))
+		return -EIO;
+
+	extra_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
+	frame = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	if (zuma_decon_irq_owner_state(zdev) != ZUMA_DECON_IRQ_INHERITED ||
+	    zdev->irq_routes_enabled ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+		ZUMA_DECON_INT_INHERITED_QUIESCENT ||
+	    extra_en != zdev->decon_inherited_extra_en ||
+	    (extra_en & ~ZUMA_DECON_EXTRA_STATUS_MASK) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON) !=
+		ZUMA_DECON_GLOBAL_EXPECTED ||
+	    readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) !=
+		ZUMA_DECON_TRIG_EXPECTED ||
+	    readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ) ||
+	    !zuma_decon_entry_profile_ready("entry", true) ||
+	    !zuma_display_active_window_valid() ||
+	    !zuma_dpp0_resetless_preflight_ready(zdev) ||
+	    readl(zuma_dsim0.base + ZUMA_DSIM_LINK_STATUS1) ||
+	    readl(zuma_dsim0.base + ZUMA_DSIM_MIPI_STATUS) ||
+	    !zuma_decon_pending_zero(zdev))
+		return -EIO;
+
+	ret = zuma_decon_capture_protected(zdev);
+	if (ret || readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT) != frame ||
+	    readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ))
+		return -EIO;
+
+	zuma_decon_set_irq_owner_state(zdev, ZUMA_DECON_IRQ_ACQUIRING);
+	*acquisition_started = true;
+	ret = zuma_decon_configure_owned_irqs(zdev);
+	if (ret ||
+	    readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT) != frame ||
+	    readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ) ||
+	    !zuma_decon_entry_profile_ready("owned-pretrigger", true) ||
+	    !zuma_decon_protected_ready(zdev))
+		return -EIO;
+
+	zuma_decon_log_preserved_profile("owned-pretrigger");
+	pr_info("zuma-display-handoff: DECON0 inherited-profile IRQ acquisition ready frame=%#x main=%#x leaf=%#x functional-writes=none no-reset=yes\n",
+		frame, (u32)ZUMA_DECON_INT_OWNED_QUIESCENT,
+		(u32)ZUMA_DECON_EXTRA_OWNED);
+	return 0;
+}
+
+static void zuma_decon_disable_irq_routes(struct zuma_drm *zdev)
+{
+	if (!zdev->irq_routes_enabled)
+		return;
+	disable_irq(zdev->frame_done_irq);
+	disable_irq(zdev->extra_irq);
+	disable_irq(zdev->frame_start_irq);
+	synchronize_irq(zdev->frame_done_irq);
+	synchronize_irq(zdev->extra_irq);
+	synchronize_irq(zdev->frame_start_irq);
+	zdev->irq_routes_enabled = false;
+}
+
+static int zuma_decon_fail_quiesce(struct zuma_drm *zdev)
+{
+	enum zuma_decon_irq_owner_state state;
+	u32 trigger;
+	int ret = 0;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	state = zuma_decon_irq_owner_state(zdev);
+	if (state == ZUMA_DECON_IRQ_SHUTDOWN)
+		return 0;
+	zuma_drm_set_irq_proof_armed(zdev, false);
+	if (state == ZUMA_DECON_IRQ_INHERITED) {
+		zuma_decon_disable_irq_routes(zdev);
+		if (!zuma_decon_pending_zero(zdev))
+			ret = -EIO;
+		return ret;
+	}
+
+	zuma_display_set_hw_trigger(false);
+	trigger = readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON);
+	if ((trigger & (ZUMA_DECON_TRIG_HW_EN |
+			ZUMA_DECON_TRIG_HW_MASK)) != ZUMA_DECON_TRIG_HW_MASK)
+		ret = -EIO;
+	writel(0, zuma_decon0.base + ZUMA_DECON_INT_EN);
+	writel(0, zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA))
+		ret = -EIO;
+	zuma_decon_disable_irq_routes(zdev);
+	if (zuma_drm_clear_pending(zdev, true))
+		ret = -EIO;
+	zuma_decon_set_irq_owner_state(zdev, ZUMA_DECON_IRQ_BROKEN);
+	return ret;
+}
+
+static int zuma_decon_shutdown_restore(struct zuma_drm *zdev)
+{
+	enum zuma_decon_irq_owner_state state;
+	u32 trigger;
+	int ret = 0;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	state = zuma_decon_irq_owner_state(zdev);
+	if (state == ZUMA_DECON_IRQ_SHUTDOWN)
+		return 0;
+	zuma_drm_set_irq_proof_armed(zdev, false);
+	if (state == ZUMA_DECON_IRQ_INHERITED) {
+		zuma_decon_disable_irq_routes(zdev);
+		trigger = readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON);
+		if ((trigger & (ZUMA_DECON_TRIG_HW_EN |
+				ZUMA_DECON_TRIG_HW_MASK)) !=
+		    ZUMA_DECON_TRIG_HW_MASK ||
+		    !zuma_decon_pending_zero(zdev) ||
+		    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+			zdev->decon_inherited_extra_en ||
+		    readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+			zdev->decon_inherited_int_en)
+			ret = -EIO;
+		zuma_decon_set_irq_owner_state(zdev, ZUMA_DECON_IRQ_SHUTDOWN);
+		return ret;
+	}
+
+	zuma_display_set_hw_trigger(false);
+	trigger = readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON);
+	if ((trigger & (ZUMA_DECON_TRIG_HW_EN |
+			ZUMA_DECON_TRIG_HW_MASK)) != ZUMA_DECON_TRIG_HW_MASK)
+		ret = -EIO;
+	writel(0, zuma_decon0.base + ZUMA_DECON_INT_EN);
+	writel(0, zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA))
+		ret = -EIO;
+	zuma_decon_disable_irq_routes(zdev);
+	if (zuma_drm_clear_pending(zdev, true))
+		ret = -EIO;
+	writel(zdev->decon_inherited_extra_en,
+	       zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
+	writel(zdev->decon_inherited_int_en,
+	       zuma_decon0.base + ZUMA_DECON_INT_EN);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+	    zdev->decon_inherited_extra_en ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+	    zdev->decon_inherited_int_en)
+		ret = -EIO;
+	zuma_decon_set_irq_owner_state(zdev, ZUMA_DECON_IRQ_SHUTDOWN);
+	return ret;
+}
+
 static int zuma_drm_enable_irq_routes(struct zuma_drm *zdev)
 {
+	u32 extra_en;
+
+	extra_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
 	if (zdev->irq_routes_enabled ||
+	    zuma_decon_irq_owner_state(zdev) != ZUMA_DECON_IRQ_INHERITED ||
 	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
-		ZUMA_DECON_INT_QUIESCENT)
+		ZUMA_DECON_INT_INHERITED_QUIESCENT ||
+	    (extra_en & ~ZUMA_DECON_EXTRA_STATUS_MASK) ||
+	    !zuma_decon_pending_zero(zdev))
 		return -EIO;
-	if (zuma_drm_clear_frame_pending(true))
+
+	zdev->decon_inherited_int_en = ZUMA_DECON_INT_INHERITED_QUIESCENT;
+	zdev->decon_inherited_extra_en = extra_en;
+	pr_info("zuma-display-handoff: captured inherited DECON IRQ controls with routes disabled main=%#x leaf=%#x stock-spi=%#x/%#x/%#x\n",
+		zdev->decon_inherited_int_en, zdev->decon_inherited_extra_en,
+		0xf3, 0xf2, 0xf1);
+	return 0;
+}
+
+static int zuma_decon_enable_owned_irq_routes(struct zuma_drm *zdev)
+{
+	if (zdev->irq_routes_enabled ||
+	    zuma_decon_irq_owner_state(zdev) != ZUMA_DECON_IRQ_ACQUIRING ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+		ZUMA_DECON_INT_OWNED_QUIESCENT ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+		ZUMA_DECON_EXTRA_OWNED ||
+	    !zuma_decon_pending_zero(zdev))
 		return -EIO;
 
 	zdev->irq_routes_enabled = true;
-	enable_irq(zdev->frame_start_irq);
 	enable_irq(zdev->frame_done_irq);
-	pr_info("zuma-display-handoff: enabled DECON frame IRQ routes with master gated by DRM vblank refs\n");
+	enable_irq(zdev->extra_irq);
+	enable_irq(zdev->frame_start_irq);
+	if (!zuma_decon_pending_zero(zdev))
+		return -EIO;
+	pr_info("zuma-display-handoff: enabled owned DECON IRQ routes start=%d done=%d extra=%d main=%#x leaf=%#x\n",
+		zdev->frame_start_irq, zdev->frame_done_irq, zdev->extra_irq,
+		(u32)ZUMA_DECON_INT_OWNED_QUIESCENT,
+		(u32)ZUMA_DECON_EXTRA_OWNED);
 	return 0;
 }
 
 static int zuma_drm_crtc_enable_vblank(struct drm_crtc *crtc)
 {
 	struct zuma_drm *zdev = container_of(crtc, struct zuma_drm, crtc);
+	enum zuma_decon_irq_owner_state state;
+	u32 active;
 	u32 int_en;
+	u32 quiescent;
 
 	if (!zdev->irq_routes_enabled || READ_ONCE(zuma_drm_update_failed))
 		return -EIO;
-
-	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
-	if (int_en == ZUMA_DECON_INT_ACTIVE)
-		return 0;
-	if (int_en != ZUMA_DECON_INT_QUIESCENT ||
-	    zuma_drm_clear_frame_pending(true))
+	state = zuma_decon_irq_owner_state(zdev);
+	if (state != ZUMA_DECON_IRQ_OWNED &&
+	    (state != ZUMA_DECON_IRQ_ACQUIRING ||
+	     !zuma_drm_irq_proof_is_armed(zdev)))
+		return -EIO;
+	quiescent = zuma_decon_int_quiescent(zdev);
+	active = zuma_decon_int_active(zdev);
+	if (!quiescent || !active)
+		return -EIO;
+	if (state != ZUMA_DECON_IRQ_INHERITED &&
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+		ZUMA_DECON_EXTRA_OWNED)
 		return -EIO;
 
-	writel(ZUMA_DECON_INT_ACTIVE,
-	       zuma_decon0.base + ZUMA_DECON_INT_EN);
-	return readl(zuma_decon0.base + ZUMA_DECON_INT_EN) ==
-		ZUMA_DECON_INT_ACTIVE ? 0 : -EIO;
+	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
+	if (int_en == active)
+		return 0;
+	if (int_en != quiescent)
+		return -EIO;
+	if (state == ZUMA_DECON_IRQ_INHERITED) {
+		if (!zuma_decon_pending_zero(zdev))
+			return -EIO;
+	} else if (zuma_drm_clear_pending(zdev, false)) {
+		return -EIO;
+	}
+
+	writel(active, zuma_decon0.base + ZUMA_DECON_INT_EN);
+	return readl(zuma_decon0.base + ZUMA_DECON_INT_EN) == active ?
+		0 : -EIO;
 }
 
 static void zuma_drm_crtc_disable_vblank(struct drm_crtc *crtc)
 {
 	struct zuma_drm *zdev = container_of(crtc, struct zuma_drm, crtc);
+	u32 active;
 	u32 int_en;
+	u32 quiescent;
 
 	if (!zdev->irq_routes_enabled)
 		return;
+	quiescent = zuma_decon_int_quiescent(zdev);
+	active = zuma_decon_int_active(zdev);
+	if (!quiescent || !active)
+		return;
 
 	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
-	if (int_en == ZUMA_DECON_INT_QUIESCENT)
+	if (int_en == quiescent)
 		return;
-	if (int_en != ZUMA_DECON_INT_ACTIVE)
+	if (int_en != active)
 		goto fail;
 
-	writel(ZUMA_DECON_INT_QUIESCENT,
-	       zuma_decon0.base + ZUMA_DECON_INT_EN);
-	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) ==
-	    ZUMA_DECON_INT_QUIESCENT)
+	writel(quiescent, zuma_decon0.base + ZUMA_DECON_INT_EN);
+	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) == quiescent)
 		return;
 
 fail:
-	atomic_set(&zdev->irq_error, 1);
-	WRITE_ONCE(zuma_drm_update_failed, true);
-	queue_work(zdev->workqueue, &zdev->dpp_irq_fault_work);
-	pr_err("zuma-display-handoff: failed to gate DECON frame interrupts\n");
+	zuma_drm_latch_irq_fault(zdev);
+	pr_err("zuma-display-handoff: failed to gate DECON interrupts owner=%u main=%#x\n",
+	       zuma_decon_irq_owner_state(zdev),
+	       readl(zuma_decon0.base + ZUMA_DECON_INT_EN));
 }
 
 static int zuma_drm_quiesce_irq_proof(struct zuma_drm *zdev,
@@ -2861,25 +4215,33 @@ static int zuma_drm_quiesce_irq_proof(struct zuma_drm *zdev,
 		synchronize_irq(zdev->dpp_core_irq);
 		synchronize_irq(zdev->dpp_dma_irq);
 	}
-	synchronize_irq(zdev->frame_start_irq);
-	synchronize_irq(zdev->frame_done_irq);
-	return zuma_drm_clear_frame_pending(allow_pending);
+	if (zdev->irq_routes_enabled) {
+		synchronize_irq(zdev->frame_start_irq);
+		synchronize_irq(zdev->frame_done_irq);
+		synchronize_irq(zdev->extra_irq);
+	}
+	return zuma_drm_clear_pending(zdev, allow_pending);
 }
 
 static int zuma_drm_prepare_irq_proof(struct zuma_drm *zdev,
 				      struct zuma_drm_irq_proof *proof)
 {
 	enum zuma_dpp0_irq_owner_state owner_state;
+	u32 active = zuma_decon_int_active(zdev);
 	u32 int_en;
+	u32 quiescent = zuma_decon_int_quiescent(zdev);
 	int ret;
 
 	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
-	if (!zdev->irq_routes_enabled ||
-	    (int_en != ZUMA_DECON_INT_QUIESCENT &&
-	     int_en != ZUMA_DECON_INT_ACTIVE))
+	if (!zdev->irq_routes_enabled || !zuma_decon_irq_handler_live(zdev) ||
+	    (int_en != quiescent && int_en != active) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+		ZUMA_DECON_EXTRA_OWNED ||
+	    !zuma_decon_entry_profile_ready("proof-prepare", true) ||
+	    !zuma_decon_protected_ready(zdev))
 		return -EIO;
 
-	ret = zuma_drm_quiesce_irq_proof(zdev, !zdev->irq_proven_once);
+	ret = zuma_drm_quiesce_irq_proof(zdev, false);
 	if (ret || READ_ONCE(zuma_drm_update_failed))
 		return ret ? ret : -EIO;
 
@@ -2997,8 +4359,14 @@ static int zuma_drm_wait_frame_irqs(struct zuma_drm *zdev,
 			ret = -EIO;
 		}
 	}
-	if (!ret && readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
-	    ZUMA_DECON_INT_ACTIVE)
+	if (!ret &&
+	    (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+		zuma_decon_int_active(zdev) ||
+	     readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+		ZUMA_DECON_EXTRA_OWNED ||
+	     !zuma_decon_irq_handler_live(zdev) ||
+	     !zuma_decon_entry_profile_ready("post-frame", true) ||
+	     !zuma_decon_protected_ready(zdev)))
 		ret = -EIO;
 	if (!ret)
 		zdev->irq_proven_once = true;
@@ -3016,16 +4384,29 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	bool replay_pending = replay_stage < ZUMA_DPP0_REPLAY_DONE;
 	bool replay_started = false;
 	bool lifecycle_started = false;
+	bool decon_acquisition_started = false;
 	bool profile_started = false;
 	bool trigger_issued = false;
+	bool proof_sampled = false;
 	bool vblank_ref = false;
 	int cleanup_ret;
+	int decon_ret;
 	int restore_ret;
 	int ret;
 
 	arch_sync_dma_for_device(zuma_framebuffer_phys, ZUMA_HANDOFF_FB_SIZE,
 				 DMA_TO_DEVICE);
 	arch_sync_dma_flush();
+
+	if (zuma_decon_irq_owner_state(zdev) == ZUMA_DECON_IRQ_INHERITED) {
+		ret = zuma_decon_acquire_irq_ownership(zdev, &decon_acquisition_started);
+		if (ret)
+			goto out_abort;
+	} else if (zuma_decon_irq_owner_state(zdev) !=
+		   ZUMA_DECON_IRQ_OWNED) {
+		ret = -EIO;
+		goto out_abort;
+	}
 
 	ret = zuma_drm_prepare_irq_proof(zdev, &proof);
 	if (ret)
@@ -3035,7 +4416,7 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 		goto out_abort;
 	vblank_ref = true;
 	if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
-	    ZUMA_DECON_INT_ACTIVE) {
+	    zuma_decon_int_active(zdev)) {
 		ret = -EIO;
 		goto out_abort;
 	}
@@ -3065,11 +4446,12 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	if (ret)
 		goto out_abort;
 	ret = zuma_drm_wait_frame_irqs(zdev, &proof, release_after_frame);
+	proof_sampled = true;
 	if (ret)
 		goto out_abort;
 	if (!zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
-						zuma_framebuffer_ctrl,
-						ZUMA_DECON_INT_ACTIVE)) {
+						  zuma_framebuffer_ctrl,
+						  zuma_decon_int_active(zdev))) {
 		ret = -EIO;
 		goto out_abort;
 	}
@@ -3095,9 +4477,27 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 			operation);
 	}
 
+	if (decon_acquisition_started) {
+		if (zuma_decon_irq_owner_state(zdev) !=
+		    ZUMA_DECON_IRQ_ACQUIRING) {
+			ret = -EIO;
+			goto out_abort;
+		}
+		zuma_decon_set_irq_owner_state(zdev, ZUMA_DECON_IRQ_OWNED);
+		zuma_decon_log_preserved_profile("post-frame");
+		pr_info("zuma-display-handoff: DECON0 IRQ ownership over inherited profile proven frame=%#x->%#x main=%#x leaf=%#x functional-writes=none no-reset=yes\n",
+			frame_before, frame_after,
+			readl(zuma_decon0.base + ZUMA_DECON_INT_EN),
+			readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA));
+	} else if (zuma_decon_irq_owner_state(zdev) !=
+		   ZUMA_DECON_IRQ_OWNED) {
+		ret = -EIO;
+		goto out_abort;
+	}
+
 	zuma_drm_update_count++;
 	if (zuma_drm_update_count <= 8) {
-		pr_info("zuma-display-handoff: DRM %s %llu bytes=0..%zu frame=%#x->%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu owner=%u\n",
+		pr_info("zuma-display-handoff: DRM %s %llu bytes=0..%zu frame=%#x->%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu decon-owner=%u dpp-owner=%u\n",
 			operation, (unsigned long long)zuma_drm_update_count,
 			(size_t)ZUMA_HANDOFF_FB_SIZE - 1,
 			frame_before, frame_after,
@@ -3111,6 +4511,7 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 			(unsigned long long)proof.dpp_dma_after,
 			(unsigned long long)proof.dpp_core_before,
 			(unsigned long long)proof.dpp_core_after,
+			zuma_decon_irq_owner_state(zdev),
 			zuma_dpp0_irq_owner_state(zdev));
 		zuma_dpp0_preflight_snapshot(operation);
 	}
@@ -3119,21 +4520,24 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	return 0;
 
 out_abort:
-	zuma_display_set_hw_trigger(false);
-	cleanup_ret = zuma_drm_quiesce_irq_proof(zdev, true);
+	if (zuma_decon_irq_owner_state(zdev) == ZUMA_DECON_IRQ_INHERITED) {
+		zuma_drm_set_irq_proof_armed(zdev, false);
+		cleanup_ret = zuma_decon_pending_zero(zdev) ? 0 : -EIO;
+	} else {
+		zuma_display_set_hw_trigger(false);
+		cleanup_ret = zuma_drm_quiesce_irq_proof(zdev, true);
+	}
+	decon_ret = zuma_decon_fail_quiesce(zdev);
 	if (profile_started)
 		restore_ret = zuma_dpp0_resetless_fail_quiesce(zdev);
 	else
 		restore_ret = zuma_dpp0_irq_restore(zdev);
 	if (!ret)
-		ret = cleanup_ret ? cleanup_ret : restore_ret;
+		ret = cleanup_ret ? cleanup_ret :
+		      decon_ret ? decon_ret : restore_ret;
+	WRITE_ONCE(zuma_drm_update_failed, true);
 	if (vblank_ref)
 		drm_crtc_vblank_put(&zdev->crtc);
-	synchronize_irq(zdev->frame_start_irq);
-	synchronize_irq(zdev->frame_done_irq);
-	if (zuma_drm_clear_frame_pending(true) && !ret)
-		ret = -EIO;
-	WRITE_ONCE(zuma_drm_update_failed, true);
 	if (replay_started || lifecycle_started)
 		pr_err("zuma-display-handoff: DPP0 stage %s failed stage-unchanged profile-started=%s trigger-issued=%s outcome=%s owner=%u restore=%s poison=yes\n",
 		       zuma_dpp0_replay_stage_name(replay_stage),
@@ -3144,7 +4548,16 @@ out_abort:
 		       "visible-frame-preserved",
 		       zuma_dpp0_irq_owner_state(zdev),
 		       restore_ret ? "failed" : "ok");
-	pr_err("zuma-display-handoff: DRM %s failed closed: %d, frame=%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu\n",
+	if (!proof_sampled) {
+		pr_err("zuma-display-handoff: DRM %s failed closed: %d frame=unavailable counters=unavailable decon-started=%s trigger-issued=%s decon-cleanup=%s irq-cleanup=%s dpp-restore=%s\n",
+		       operation, ret, decon_acquisition_started ? "yes" : "no",
+		       trigger_issued ? "yes" : "no",
+		       decon_ret ? "failed" : "ok",
+		       cleanup_ret ? "failed" : "ok",
+		       restore_ret ? "failed" : "ok");
+		return ret;
+	}
+	pr_err("zuma-display-handoff: DRM %s failed closed: %d frame=%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu decon-started=%s decon-cleanup=%s irq-cleanup=%s dpp-restore=%s\n",
 	       operation, ret, frame_after,
 	       (unsigned long long)proof.frame_start_before,
 	       (unsigned long long)proof.frame_start_after,
@@ -3155,8 +4568,31 @@ out_abort:
 	       (unsigned long long)proof.dpp_dma_before,
 	       (unsigned long long)proof.dpp_dma_after,
 	       (unsigned long long)proof.dpp_core_before,
-	       (unsigned long long)proof.dpp_core_after);
+	       (unsigned long long)proof.dpp_core_after,
+	       decon_acquisition_started ? "yes" : "no",
+	       decon_ret ? "failed" : "ok",
+	       cleanup_ret ? "failed" : "ok",
+	       restore_ret ? "failed" : "ok");
 	return ret;
+}
+
+static void zuma_drm_copy_shadow(struct drm_framebuffer *fb,
+				 const struct iosys_map *source)
+{
+	unsigned int y;
+
+	if (fb->pitches[0] == ZUMA_HANDOFF_FB_STRIDE) {
+		iosys_map_memcpy_from(zuma_scanout_buffer, source, 0,
+				      ZUMA_HANDOFF_FB_SIZE);
+		return;
+	}
+
+	/* Source padding is not scanout content; copy every visible pixel. */
+	for (y = 0; y < ZUMA_HANDOFF_FB_HEIGHT; y++)
+		iosys_map_memcpy_from((u8 *)zuma_scanout_buffer +
+				      (size_t)y * ZUMA_HANDOFF_FB_STRIDE,
+				      source, (size_t)y * fb->pitches[0],
+				      ZUMA_HANDOFF_FB_STRIDE);
 }
 
 static int zuma_drm_commit_shadow(struct drm_atomic_commit *state,
@@ -3200,9 +4636,7 @@ static int zuma_drm_commit_shadow(struct drm_atomic_commit *state,
 
 	if (fail_closed)
 		*fail_closed = true;
-	iosys_map_memcpy_from(zuma_scanout_buffer,
-			      &shadow_plane_state->data[0], 0,
-			      ZUMA_HANDOFF_FB_SIZE);
+	zuma_drm_copy_shadow(fb, &shadow_plane_state->data[0]);
 	ret = zuma_drm_finish_scanout_update(zdev, "shadow update", false);
 
 out_unlock:
@@ -3213,6 +4647,8 @@ out_unlock:
 
 static int zuma_drm_restore_boot_buffer(struct zuma_drm *zdev)
 {
+	int decon_ret;
+	int dpp_ret;
 	int ret;
 
 	mutex_lock(&zuma_display_mmio_lock);
@@ -3227,10 +4663,11 @@ static int zuma_drm_restore_boot_buffer(struct zuma_drm *zdev)
 		   ZUMA_HANDOFF_FB_SIZE)) {
 		ret = -EIO;
 		WRITE_ONCE(zuma_drm_update_failed, true);
-		zuma_display_set_hw_trigger(false);
-		if (zuma_dpp0_irq_restore(zdev))
-			pr_err("zuma-display-handoff: DPP0 IRQ restore failed after boot copy failure\n");
-		pr_err("zuma-display-handoff: DRM boot restore copy failed closed\n");
+		decon_ret = zuma_decon_fail_quiesce(zdev);
+		dpp_ret = zuma_dpp0_irq_restore(zdev);
+		pr_err("zuma-display-handoff: DRM boot restore copy failed closed decon=%s dpp=%s\n",
+		       decon_ret ? "failed" : "ok",
+		       dpp_ret ? "failed" : "ok");
 		goto out_unlock;
 	}
 
@@ -3246,9 +4683,8 @@ static int zuma_drm_reboot_notifier(struct notifier_block *notifier,
 {
 	struct zuma_drm *zdev =
 		container_of(notifier, struct zuma_drm, reboot_notifier);
-	u32 int_en;
-	int cleanup_ret;
-	int ret = 0;
+	int decon_ret;
+	int dpp_ret;
 
 	mutex_lock(&zdev->commit_admission_lock);
 	WRITE_ONCE(zuma_drm_update_failed, true);
@@ -3256,35 +4692,15 @@ static int zuma_drm_reboot_notifier(struct notifier_block *notifier,
 	flush_workqueue(zdev->workqueue);
 
 	mutex_lock(&zuma_display_mmio_lock);
-	zuma_display_set_hw_trigger(false);
-	ret = zuma_dpp0_irq_restore(zdev);
-	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
-	if (int_en == ZUMA_DECON_INT_ACTIVE) {
-		writel(ZUMA_DECON_INT_QUIESCENT,
-		       zuma_decon0.base + ZUMA_DECON_INT_EN);
-		if (readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
-		    ZUMA_DECON_INT_QUIESCENT)
-			ret = -EIO;
-	} else if (int_en != ZUMA_DECON_INT_QUIESCENT) {
-		ret = -EIO;
-	}
-	zuma_drm_set_irq_proof_armed(zdev, false);
-	cleanup_ret = zuma_drm_clear_frame_pending(true);
-	if (!ret)
-		ret = cleanup_ret;
-	if (zdev->irq_routes_enabled) {
-		disable_irq_nosync(zdev->frame_done_irq);
-		disable_irq_nosync(zdev->frame_start_irq);
-		zdev->irq_routes_enabled = false;
-		synchronize_irq(zdev->frame_done_irq);
-		synchronize_irq(zdev->frame_start_irq);
-	}
+	decon_ret = zuma_decon_shutdown_restore(zdev);
+	dpp_ret = zuma_dpp0_irq_restore(zdev);
 	mutex_unlock(&zuma_display_mmio_lock);
 
 	cancel_work_sync(&zdev->dpp_irq_fault_work);
 	flush_workqueue(zdev->workqueue);
-	pr_info("zuma-display-handoff: reboot IRQ lifecycle shutdown restore=%s\n",
-		ret ? "failed" : "ok");
+	pr_info("zuma-display-handoff: reboot IRQ lifecycle shutdown restore=%s decon=%s dpp=%s\n",
+		decon_ret || dpp_ret ? "failed" : "ok",
+		decon_ret ? "failed" : "ok", dpp_ret ? "failed" : "ok");
 	return NOTIFY_DONE;
 }
 
@@ -3293,10 +4709,15 @@ static int zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
 	struct drm_crtc_state *new_crtc_state;
 	struct drm_pending_vblank_event *event;
+	const char *completion_type;
 	unsigned long flags;
 	u64 sequence;
+	u32 active;
 	u32 int_en;
+	u32 quiescent;
 	bool failed = false;
+	int decon_ret;
+	int dpp_ret;
 
 	new_crtc_state = drm_atomic_get_new_crtc_state(state, &zdev->crtc);
 	if (WARN_ON(!new_crtc_state))
@@ -3306,11 +4727,18 @@ static int zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 	drm_crtc_vblank_put(&zdev->crtc);
 	synchronize_irq(zdev->frame_start_irq);
 	synchronize_irq(zdev->frame_done_irq);
-	if (zuma_drm_clear_frame_pending(false))
+	synchronize_irq(zdev->extra_irq);
+	if (zuma_drm_clear_pending(zdev, false))
 		failed = true;
+	quiescent = zuma_decon_int_quiescent(zdev);
+	active = zuma_decon_int_active(zdev);
 	int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
-	if (int_en != ZUMA_DECON_INT_QUIESCENT &&
-	    int_en != ZUMA_DECON_INT_ACTIVE)
+	if (zuma_decon_irq_owner_state(zdev) != ZUMA_DECON_IRQ_OWNED ||
+	    (int_en != quiescent && int_en != active) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+		ZUMA_DECON_EXTRA_OWNED ||
+	    !zuma_decon_entry_profile_ready("event-complete", true) ||
+	    !zuma_decon_protected_ready(zdev))
 		failed = true;
 	if (READ_ONCE(zuma_drm_update_failed))
 		failed = true;
@@ -3319,6 +4747,9 @@ static int zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 
 	spin_lock_irqsave(&state->dev->event_lock, flags);
 	event = new_crtc_state->event;
+	/* The helper also allocates completion-only events with no DRM file. */
+	completion_type = !event ? "no-event completion" :
+		event->base.file_priv ? "event" : "internal completion";
 	if (event) {
 		drm_crtc_send_vblank_event(&zdev->crtc, event);
 		new_crtc_state->event = NULL;
@@ -3327,15 +4758,19 @@ static int zuma_drm_complete_vblank_event(struct drm_atomic_commit *state)
 
 	if (zuma_drm_update_count <= 8)
 		pr_info("zuma-display-handoff: DRM real vblank %s %llu sequence=%llu int-en=%#x\n",
-			event ? "event" : "no-event completion",
+			completion_type,
 			(unsigned long long)zuma_drm_update_count,
 			(unsigned long long)sequence, int_en);
 	return 0;
 
 out_failed:
-	WRITE_ONCE(zuma_drm_update_failed, true);
-	queue_work(zdev->workqueue, &zdev->dpp_irq_fault_work);
-	pr_err("zuma-display-handoff: DRM vblank event completion failed closed\n");
+	zuma_drm_mark_irq_fault(zdev);
+	mutex_lock(&zuma_display_mmio_lock);
+	decon_ret = zuma_decon_fail_quiesce(zdev);
+	dpp_ret = zuma_dpp0_irq_restore(zdev);
+	mutex_unlock(&zuma_display_mmio_lock);
+	pr_err("zuma-display-handoff: DRM vblank event completion failed closed decon=%s dpp=%s\n",
+	       decon_ret ? "failed" : "ok", dpp_ret ? "failed" : "ok");
 	return -EIO;
 }
 
@@ -3394,6 +4829,48 @@ static void zuma_drm_commit_tail(struct drm_atomic_commit *state,
 	drm_atomic_helper_commit_cleanup_done(state);
 }
 
+static int zuma_drm_wait_for_fences(struct drm_atomic_commit *state,
+				    bool pre_swap)
+{
+	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
+	struct drm_plane_state *plane_state;
+	unsigned long deadline;
+	unsigned long now;
+	long ret;
+	long slice;
+	int status;
+
+	plane_state = drm_atomic_get_new_plane_state(state, &zdev->primary_plane);
+	if (!plane_state || !plane_state->fence)
+		return 0;
+	if (WARN_ON(!plane_state->fb))
+		return -EINVAL;
+
+	/* A stuck producer must not strand the worker or warm-reboot flush. */
+	deadline = jiffies + msecs_to_jiffies(ZUMA_DRM_FENCE_TIMEOUT_MS);
+	for (;;) {
+		if (READ_ONCE(zuma_drm_update_failed))
+			return -ESHUTDOWN;
+		status = dma_fence_get_status(plane_state->fence);
+		if (status < 0)
+			return status;
+		if (status > 0) {
+			dma_fence_put(plane_state->fence);
+			plane_state->fence = NULL;
+			return 0;
+		}
+		now = jiffies;
+		if (time_after_eq(now, deadline))
+			return -ETIMEDOUT;
+		slice = min_t(unsigned long, deadline - now,
+			      msecs_to_jiffies(ZUMA_DRM_FENCE_POLL_MS));
+		ret = dma_fence_wait_timeout(plane_state->fence, pre_swap, slice);
+		if (ret < 0)
+			return ret;
+		/* Recheck status, including producer errors, before any copy. */
+	}
+}
+
 static void zuma_drm_commit_work(struct work_struct *work)
 {
 	struct drm_atomic_commit *state =
@@ -3401,21 +4878,24 @@ static void zuma_drm_commit_work(struct work_struct *work)
 	struct zuma_drm *zdev =
 		container_of(state->dev, struct zuma_drm, drm);
 	bool fail_closed = false;
+	int decon_ret;
+	int dpp_ret;
 	int ret;
 
-	ret = drm_atomic_helper_wait_for_fences(state->dev, state, false);
+	ret = zuma_drm_wait_for_fences(state, false);
 	drm_atomic_helper_wait_for_dependencies(state);
 	if (!ret)
 		ret = zuma_drm_commit_shadow(state, &fail_closed);
 	if (ret && (fail_closed || READ_ONCE(zuma_drm_update_failed))) {
 		WRITE_ONCE(zuma_drm_update_failed, true);
 		mutex_lock(&zuma_display_mmio_lock);
-		zuma_display_set_hw_trigger(false);
-		if (zuma_dpp0_irq_restore(zdev))
-			pr_err("zuma-display-handoff: DPP0 IRQ restore failed after asynchronous update failure\n");
+		decon_ret = zuma_decon_fail_quiesce(zdev);
+		dpp_ret = zuma_dpp0_irq_owner_state(zdev) ==
+			ZUMA_DPP0_IRQ_BROKEN ? -EIO : zuma_dpp0_irq_restore(zdev);
 		mutex_unlock(&zuma_display_mmio_lock);
-		pr_err("zuma-display-handoff: asynchronous DRM update failed closed: %d; "
-		       "flip event cancelled\n", ret);
+		pr_err("zuma-display-handoff: asynchronous DRM update failed closed: %d decon=%s dpp=%s; flip event cancelled\n",
+		       ret, decon_ret ? "failed" : "ok",
+		       dpp_ret ? "failed" : "ok");
 	} else if (ret) {
 		pr_err("zuma-display-handoff: asynchronous DRM update cancelled before framebuffer access: %d; flip event cancelled\n",
 		       ret);
@@ -3435,6 +4915,9 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 	struct drm_crtc_state *new_crtc_state;
 	bool restore_boot;
 	bool update_scanout;
+	bool admission_locked = false;
+	int decon_ret;
+	int dpp_ret;
 	int ret;
 
 	old_plane_state =
@@ -3489,7 +4972,13 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 		return 0;
 	}
 
-	ret = drm_atomic_helper_wait_for_fences(drm, state, true);
+	mutex_lock(&zdev->commit_admission_lock);
+	admission_locked = true;
+	if (READ_ONCE(zuma_drm_update_failed)) {
+		ret = -EIO;
+		goto out_unprepare;
+	}
+	ret = zuma_drm_wait_for_fences(state, true);
 	if (ret)
 		goto out_unprepare;
 	drm_atomic_helper_wait_for_dependencies(state);
@@ -3506,19 +4995,24 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 		drm_crtc_vblank_put(&zdev->crtc);
 		mutex_lock(&zuma_display_mmio_lock);
 		WRITE_ONCE(zuma_drm_update_failed, true);
-		zuma_display_set_hw_trigger(false);
-		if (zuma_dpp0_irq_restore(zdev))
-			pr_err("zuma-display-handoff: DPP0 IRQ restore failed after state-swap failure\n");
+		decon_ret = zuma_decon_fail_quiesce(zdev);
+		dpp_ret = zuma_dpp0_irq_restore(zdev);
 		mutex_unlock(&zuma_display_mmio_lock);
+		pr_err("zuma-display-handoff: DRM state-swap failure cleanup decon=%s dpp=%s\n",
+		       decon_ret ? "failed" : "ok",
+		       dpp_ret ? "failed" : "ok");
 		goto out_unprepare;
 	}
 
 	drm_atomic_commit_get(state);
 	zuma_drm_commit_tail(state, 0);
 	drm_atomic_commit_put(state);
+	mutex_unlock(&zdev->commit_admission_lock);
 	return 0;
 
 out_unprepare:
+	if (admission_locked)
+		mutex_unlock(&zdev->commit_admission_lock);
 	drm_atomic_helper_unprepare_planes(drm, state);
 	return ret;
 }
@@ -3662,7 +5156,7 @@ static int zuma_display_rollback_format(u32 *ctrl_after,
 	}
 
 	if (!zuma_display_update_ready_for_ctrl(ctrl, shadow_ctrl,
-						ZUMA_DECON_INT_QUIESCENT)) {
+						ZUMA_DECON_INT_INHERITED_QUIESCENT)) {
 		pr_err("zuma-display-handoff: refusing format rollback from unsafe ctrl=%#x shadow=%#x\n",
 		       ctrl, shadow_ctrl);
 		return -EIO;
@@ -3683,7 +5177,7 @@ static int zuma_display_rollback_format(u32 *ctrl_after,
 			return ret;
 		if (!zuma_display_update_ready_for_ctrl(ZUMA_HANDOFF_FB_CTRL,
 							ZUMA_HANDOFF_FB_CTRL,
-							ZUMA_DECON_INT_QUIESCENT))
+							ZUMA_DECON_INT_INHERITED_QUIESCENT))
 			return -EIO;
 		*ctrl_after = ZUMA_HANDOFF_FB_CTRL;
 		return 0;
@@ -3871,7 +5365,8 @@ static int __init zuma_display_handoff_init(void)
 	}
 	of_node_put(root);
 
-	if (!zuma_dpp0_dt_contract_valid())
+	if (!zuma_decon0_dt_contract_valid() ||
+	    !zuma_dpp0_dt_contract_valid())
 		return 0;
 
 	for (i = 0; i < ARRAY_SIZE(zuma_display_blocks); i++) {
