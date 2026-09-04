@@ -3,10 +3,9 @@
  * Display bootloader handoff for Google Zuma/Husky.
  *
  * The shipping boot chain leaves a working HK3 command-mode display pipeline.
- * Until native Zuma initialization exists, preserve that state behind fixed-
- * mode DRM/KMS. Initial adoption may copy and switch only the DPP base. DRM
- * updates copy from GEM shmem into that permanent buffer and admit only the
- * proven frame trigger.
+ * Preserve the inherited DECON, DSIM, panel, clocks, and power state behind
+ * fixed-mode DRM/KMS. The first real DRM update initializes the proven
+ * RDMA/DPP0 fixed path without reset; later updates retain that ownership.
  */
 
 #include <linux/atomic.h>
@@ -140,7 +139,12 @@
 #define ZUMA_DPP_CORE_CONFIG_ERROR      0x001c
 #define ZUMA_DPP_CORE_OP_STATUS         0x0030
 #define ZUMA_DPP_CORE_IO_CON            0x0038
+#define ZUMA_DPP_CORE_INHERITED_IO      0x0080
 #define ZUMA_DPP_CORE_IMG_SIZE          0x003c
+#define ZUMA_DPP_CORE_SCL_CTRL          0x0080
+#define ZUMA_DPP_CORE_SCALED_IMG_SIZE   0x0084
+#define ZUMA_DPP_CORE_SCL_HPOSITION     0x0090
+#define ZUMA_DPP_CORE_SCL_VPOSITION     0x0094
 #define ZUMA_DPP_CORE_SHADOW_OFFSET     0x0100
 #define ZUMA_DPP_SRAMC_MODE             0x0010
 #define ZUMA_DPP_SRAMC_DST_POSITION     0x0014
@@ -181,12 +185,16 @@
 #define ZUMA_DPP_RDMA_SRC_STRIDE_0      0x0050
 #define ZUMA_DPP_RDMA_EXPECTED          0x40000000
 #define ZUMA_DPP_RDMA_BUSY              BIT(2)
+#define ZUMA_DPP_RDMA_RECOVERY_ENABLE   BIT(0)
+#define ZUMA_DPP_RDMA_DEADLOCK_ENABLE   BIT(0)
+#define ZUMA_DPP_RDMA_COUNT_MASK        GENMASK(31, 1)
 #define ZUMA_DPP_RDMA_IRQ_ENABLE        BIT(0)
 #define ZUMA_DPP_RDMA_FRAME_DONE_MASK   BIT(1)
 #define ZUMA_DPP_RDMA_ALL_IRQ_MASK      0x00001bf6
 #define ZUMA_DPP_RDMA_CONTROL_MASK      \
 	(ZUMA_DPP_RDMA_ALL_IRQ_MASK | ZUMA_DPP_RDMA_IRQ_ENABLE)
 #define ZUMA_DPP_RDMA_FRAME_DONE_IRQ    BIT(16)
+#define ZUMA_DPP_RDMA_DEADLOCK_IRQ      BIT(17)
 #define ZUMA_DPP_RDMA_CONFIG_ERR_IRQ    BIT(21)
 #define ZUMA_DPP_RDMA_ALL_IRQ_STATUS    0x0dfb0000
 #define ZUMA_DPP_RDMA_CONFIG_ERR_STATUS 0x0740
@@ -264,9 +272,7 @@ enum zuma_dpp0_replay_region {
 };
 
 enum zuma_dpp0_replay_stage {
-	ZUMA_DPP0_REPLAY_IDMA_INIT,
-	ZUMA_DPP0_REPLAY_FIXED_CONFIG,
-	ZUMA_DPP0_REPLAY_IRQ_TAKEOVER,
+	ZUMA_DPP0_REPLAY_RESETLESS_INIT,
 	ZUMA_DPP0_REPLAY_DONE,
 };
 
@@ -278,15 +284,12 @@ enum zuma_dpp0_irq_owner_state {
 	ZUMA_DPP0_IRQ_BROKEN,
 };
 
-struct zuma_dpp0_replay_write {
+struct zuma_dpp0_profile_reg {
 	const char *name;
 	enum zuma_dpp0_replay_region region;
 	u16 live;
 	u16 shadow;
-	u32 before;
 	u32 value;
-	u32 mask;
-	u32 after;
 };
 
 struct zuma_drm {
@@ -529,122 +532,76 @@ static const struct zuma_dpp0_snapshot_reg zuma_dpp0_hdr_comm_regs[] = {
 	{ "size", 0x020, 0x820 },
 };
 
-static const struct zuma_dpp0_replay_write zuma_dpp0_idma_init_replay[] = {
+static const struct zuma_dpp0_profile_reg zuma_dpp0_fixed_profile[] = {
 	{ "qos-low", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_QOS_LOW,
-	  ZUMA_DPP0_NO_SHADOW, 0x44444444, 0x44444444, ~0U, 0x44444444 },
+	  ZUMA_DPP0_NO_SHADOW, 0x44444444 },
 	{ "qos-high", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_QOS_HIGH,
-	  ZUMA_DPP0_NO_SHADOW, 0x44444444, 0x44444444, ~0U, 0x44444444 },
+	  ZUMA_DPP0_NO_SHADOW, 0x44444444 },
 	{ "dynamic-gating", ZUMA_DPP0_REPLAY_RDMA,
-	  ZUMA_DPP_RDMA_DYNAMIC_GATING, ZUMA_DPP0_NO_SHADOW,
-	  0, 0, ~0U, 0 },
-	{ "alpha-ic-max", ZUMA_DPP0_REPLAY_RDMA,
+	  ZUMA_DPP_RDMA_DYNAMIC_GATING, ZUMA_DPP0_NO_SHADOW, 0 },
+	{ "alpha-ic-max-format", ZUMA_DPP0_REPLAY_RDMA,
 	  ZUMA_DPP_RDMA_IN_CTRL_0,
 	  ZUMA_DPP_RDMA_IN_CTRL_0 + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL, 0xff400000, 0xffff0000,
 	  ZUMA_HANDOFF_FB_BGRX_CTRL },
 	{ "assigned-mo", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_ENABLE,
-	  ZUMA_DPP0_NO_SHADOW, ZUMA_DPP_RDMA_EXPECTED, 0x40000000,
-	  0xff000000, ZUMA_DPP_RDMA_EXPECTED },
-};
-
-static const struct zuma_dpp0_replay_write zuma_dpp0_fixed_replay[] = {
+	  ZUMA_DPP0_NO_SHADOW, ZUMA_DPP_RDMA_EXPECTED },
 	{ "sramc-dst", ZUMA_DPP0_REPLAY_SRAMC,
 	  ZUMA_DPP_SRAMC_DST_POSITION,
 	  ZUMA_DPP_SRAMC_DST_POSITION + ZUMA_DPP_SRAMC_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_DST_POSITION, ZUMA_DPP_FIXED_DST_POSITION, ~0U,
 	  ZUMA_DPP_FIXED_DST_POSITION },
 	{ "sramc-mode", ZUMA_DPP0_REPLAY_SRAMC, ZUMA_DPP_SRAMC_MODE,
-	  ZUMA_DPP_SRAMC_MODE + ZUMA_DPP_SRAMC_SHADOW_OFFSET,
-	  0, 0, ~0U, 0 },
+	  ZUMA_DPP_SRAMC_MODE + ZUMA_DPP_SRAMC_SHADOW_OFFSET, 0 },
+	{ "scl-disable", ZUMA_DPP0_REPLAY_DPP, ZUMA_DPP_CORE_SCL_CTRL,
+	  ZUMA_DPP_CORE_SCL_CTRL + ZUMA_DPP_CORE_SHADOW_OFFSET, 0 },
+	{ "scaled-size", ZUMA_DPP0_REPLAY_DPP,
+	  ZUMA_DPP_CORE_SCALED_IMG_SIZE,
+	  ZUMA_DPP_CORE_SCALED_IMG_SIZE + ZUMA_DPP_CORE_SHADOW_OFFSET, 0 },
+	{ "scl-hpos", ZUMA_DPP0_REPLAY_DPP,
+	  ZUMA_DPP_CORE_SCL_HPOSITION,
+	  ZUMA_DPP_CORE_SCL_HPOSITION + ZUMA_DPP_CORE_SHADOW_OFFSET, 0 },
+	{ "scl-vpos", ZUMA_DPP0_REPLAY_DPP,
+	  ZUMA_DPP_CORE_SCL_VPOSITION,
+	  ZUMA_DPP_CORE_SCL_VPOSITION + ZUMA_DPP_CORE_SHADOW_OFFSET, 0 },
 	{ "src-offset", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_SRC_OFFSET,
-	  ZUMA_DPP_RDMA_SRC_OFFSET + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  0, 0, ~0U, 0 },
+	  ZUMA_DPP_RDMA_SRC_OFFSET + ZUMA_DPP_RDMA_SHADOW_OFFSET, 0 },
 	{ "src-width", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_SRC_WIDTH,
 	  ZUMA_DPP_RDMA_SRC_WIDTH + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_HANDOFF_FB_WIDTH, ZUMA_HANDOFF_FB_WIDTH, ~0U,
 	  ZUMA_HANDOFF_FB_WIDTH },
 	{ "src-height", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_SRC_HEIGHT,
 	  ZUMA_DPP_RDMA_SRC_HEIGHT + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_HANDOFF_FB_HEIGHT, ZUMA_HANDOFF_FB_HEIGHT, ~0U,
 	  ZUMA_HANDOFF_FB_HEIGHT },
 	{ "rdma-img-size", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_IMG_SIZE,
 	  ZUMA_DPP_RDMA_IMG_SIZE + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_IMG_SIZE, ZUMA_DPP_FIXED_IMG_SIZE, ~0U,
 	  ZUMA_DPP_FIXED_IMG_SIZE },
 	{ "dpp-img-size", ZUMA_DPP0_REPLAY_DPP, ZUMA_DPP_CORE_IMG_SIZE,
 	  ZUMA_DPP_CORE_IMG_SIZE + ZUMA_DPP_CORE_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_IMG_SIZE, ZUMA_DPP_FIXED_IMG_SIZE, ~0U,
 	  ZUMA_DPP_FIXED_IMG_SIZE },
 	{ "hdr-size", ZUMA_DPP0_REPLAY_HDR_COMM, ZUMA_DPP_HDR_COMM_SIZE,
 	  ZUMA_DPP_HDR_COMM_SIZE + ZUMA_DPP_HDR_COMM_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_IMG_SIZE, ZUMA_DPP_FIXED_IMG_SIZE, ~0U,
 	  ZUMA_DPP_FIXED_IMG_SIZE },
-	{ "rotation", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_IN_CTRL_0,
-	  ZUMA_DPP_RDMA_IN_CTRL_0 + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL, 0, 0x00000070,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL },
 	{ "base-p0", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_BASEADDR_P0,
 	  ZUMA_DPP_RDMA_BASEADDR_P0 + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_SCANOUT_FB_BASE, ZUMA_SCANOUT_FB_BASE, ~0U,
 	  ZUMA_SCANOUT_FB_BASE },
 	{ "base-p1", ZUMA_DPP0_REPLAY_RDMA, ZUMA_DPP_RDMA_BASEADDR_P1,
-	  ZUMA_DPP_RDMA_BASEADDR_P1 + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  0, 0, ~0U, 0 },
-	{ "block-disable", ZUMA_DPP0_REPLAY_RDMA,
-	  ZUMA_DPP_RDMA_IN_CTRL_0,
-	  ZUMA_DPP_RDMA_IN_CTRL_0 + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL, 0, 0x00000001,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL },
-	{ "rdma-format", ZUMA_DPP0_REPLAY_RDMA,
-	  ZUMA_DPP_RDMA_IN_CTRL_0,
-	  ZUMA_DPP_RDMA_IN_CTRL_0 + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL,
-	  ZUMA_DPP_FORMAT_BGRX8888 << ZUMA_DPP_FORMAT_SHIFT,
-	  ZUMA_DPP_FORMAT_FIELD_MASK, ZUMA_HANDOFF_FB_BGRX_CTRL },
-	{ "dpp-bpc", ZUMA_DPP0_REPLAY_DPP, ZUMA_DPP_CORE_IO_CON,
-	  ZUMA_DPP_CORE_IO_CON + ZUMA_DPP_CORE_SHADOW_OFFSET,
-	  0x80, 0, 0x40, 0x80 },
-	{ "dpp-alpha", ZUMA_DPP0_REPLAY_DPP, ZUMA_DPP_CORE_IO_CON,
-	  ZUMA_DPP_CORE_IO_CON + ZUMA_DPP_CORE_SHADOW_OFFSET,
-	  0x80, 0, 0x80, 0 },
-	{ "dpp-format", ZUMA_DPP0_REPLAY_DPP, ZUMA_DPP_CORE_IO_CON,
-	  ZUMA_DPP_CORE_IO_CON + ZUMA_DPP_CORE_SHADOW_OFFSET,
-	  0, 0, 0x7, 0 },
-	{ "hdr-bpc", ZUMA_DPP0_REPLAY_HDR_COMM,
-	  ZUMA_DPP_HDR_COMM_IO_CON,
-	  ZUMA_DPP_HDR_COMM_IO_CON + ZUMA_DPP_HDR_COMM_SHADOW_OFFSET,
-	  0, 0, 0x40, 0 },
-	{ "hdr-format", ZUMA_DPP0_REPLAY_HDR_COMM,
-	  ZUMA_DPP_HDR_COMM_IO_CON,
-	  ZUMA_DPP_HDR_COMM_IO_CON + ZUMA_DPP_HDR_COMM_SHADOW_OFFSET,
-	  0, 0, 0x7, 0 },
-	{ "compression", ZUMA_DPP0_REPLAY_RDMA,
-	  ZUMA_DPP_RDMA_IN_CTRL_0,
-	  ZUMA_DPP_RDMA_IN_CTRL_0 + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL, 0, 0x0000000c,
-	  ZUMA_HANDOFF_FB_BGRX_CTRL },
-	{ "recovery-disable", ZUMA_DPP0_REPLAY_RDMA,
+	  ZUMA_DPP_RDMA_BASEADDR_P1 + ZUMA_DPP_RDMA_SHADOW_OFFSET, 0 },
+	{ "stride-p0", ZUMA_DPP0_REPLAY_RDMA,
+	  ZUMA_DPP_RDMA_SRC_STRIDE_0,
+	  ZUMA_DPP_RDMA_SRC_STRIDE_0 + ZUMA_DPP_RDMA_SHADOW_OFFSET, 0 },
+	{ "dpp-io", ZUMA_DPP0_REPLAY_DPP, ZUMA_DPP_CORE_IO_CON,
+	  ZUMA_DPP_CORE_IO_CON + ZUMA_DPP_CORE_SHADOW_OFFSET, 0 },
+	{ "hdr-io", ZUMA_DPP0_REPLAY_HDR_COMM, ZUMA_DPP_HDR_COMM_IO_CON,
+	  ZUMA_DPP_HDR_COMM_IO_CON + ZUMA_DPP_HDR_COMM_SHADOW_OFFSET, 0 },
+	{ "recovery", ZUMA_DPP0_REPLAY_RDMA,
 	  ZUMA_DPP_RDMA_RECOVERY_CTRL,
 	  ZUMA_DPP_RDMA_RECOVERY_CTRL + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_RECOVERY, 0, 0x1, ZUMA_DPP_FIXED_RECOVERY },
-	{ "recovery-count", ZUMA_DPP0_REPLAY_RDMA,
-	  ZUMA_DPP_RDMA_RECOVERY_CTRL,
-	  ZUMA_DPP_RDMA_RECOVERY_CTRL + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_RECOVERY, ZUMA_DPP_FIXED_RECOVERY, 0xfffffffe,
 	  ZUMA_DPP_FIXED_RECOVERY },
 	{ "afbc-block-size", ZUMA_DPP0_REPLAY_RDMA,
 	  ZUMA_DPP_RDMA_AFBC_PARAM,
-	  ZUMA_DPP_RDMA_AFBC_PARAM + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  0, 0, 0x3, 0 },
-	{ "deadlock-enable", ZUMA_DPP0_REPLAY_RDMA,
+	  ZUMA_DPP_RDMA_AFBC_PARAM + ZUMA_DPP_RDMA_SHADOW_OFFSET, 0 },
+	{ "deadlock", ZUMA_DPP0_REPLAY_RDMA,
 	  ZUMA_DPP_RDMA_DEADLOCK_CTRL,
 	  ZUMA_DPP_RDMA_DEADLOCK_CTRL + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_DEADLOCK, ~0U, 0x1, ZUMA_DPP_FIXED_DEADLOCK },
-	{ "deadlock-count", ZUMA_DPP0_REPLAY_RDMA,
-	  ZUMA_DPP_RDMA_DEADLOCK_CTRL,
-	  ZUMA_DPP_RDMA_DEADLOCK_CTRL + ZUMA_DPP_RDMA_SHADOW_OFFSET,
-	  ZUMA_DPP_FIXED_DEADLOCK, ZUMA_DPP_FIXED_DEADLOCK & ~0x1,
-	  0xfffffffe, ZUMA_DPP_FIXED_DEADLOCK },
+	  ZUMA_DPP_FIXED_DEADLOCK },
 };
 
 static const unsigned int zuma_snapshot_intervals_ms[] = {
@@ -1542,7 +1499,7 @@ static bool __init zuma_dpp0_dt_contract_valid(void)
 	pr_info("zuma-display-handoff: R34 DPP0 DT contract ok; DECON0 membership index=%u count=%u\n",
 		route_index, route_count);
 	pr_info("zuma-display-handoff: R34 DPP0 coverage dma=0x19900000+0x1000 dpp=0x19930000+0x1000 sramc=0x19950000+0x1000 hdr_comm=0x19960000+0x1000; scl_coef,hdr validated-unmapped\n");
-	pr_info("zuma-display-handoff: R34 DPP0 native-init-ready=no dt-attr=%#x bootloader-effective-attr=%#x unresolved=%#x\n",
+	pr_info("zuma-display-handoff: R40 DPP0 resetless fixed-init contract dt-capabilities=%#x active-profile=%#x excluded=%#x\n",
 		ZUMA_DPP0_DT_ATTR, ZUMA_DPP0_BL_EFFECTIVE_ATTR,
 		ZUMA_DPP0_DT_ATTR ^ ZUMA_DPP0_BL_EFFECTIVE_ATTR);
 	valid = true;
@@ -1771,12 +1728,8 @@ static const char *
 zuma_dpp0_replay_stage_name(enum zuma_dpp0_replay_stage stage)
 {
 	switch (stage) {
-	case ZUMA_DPP0_REPLAY_IDMA_INIT:
-		return "idma-init";
-	case ZUMA_DPP0_REPLAY_FIXED_CONFIG:
-		return "fixed-config";
-	case ZUMA_DPP0_REPLAY_IRQ_TAKEOVER:
-		return "irq-takeover";
+	case ZUMA_DPP0_REPLAY_RESETLESS_INIT:
+		return "resetless-init";
 	case ZUMA_DPP0_REPLAY_DONE:
 		return "done";
 	}
@@ -1801,85 +1754,156 @@ zuma_dpp0_replay_base(enum zuma_dpp0_replay_region region)
 	return NULL;
 }
 
-static bool
-zuma_dpp0_replay_same_reg(const struct zuma_dpp0_replay_write *a,
-			  const struct zuma_dpp0_replay_write *b)
-{
-	return a->region == b->region && a->live == b->live;
-}
-
-static int zuma_dpp0_replay_status_ready(void)
-{
-	lockdep_assert_held(&zuma_display_mmio_lock);
-
-	return readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) ==
-			ZUMA_DPP_RDMA_EXPECTED &&
-	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) == 0x00010000 &&
-	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_SWRST) == 0 &&
-	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON) == 0 &&
-	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK) == 4 &&
-	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS) == 0 &&
-	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_CONFIG_ERROR) == 0 &&
-	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_OP_STATUS) == 0 ?
-		0 : -EIO;
-}
-
-static int zuma_dpp0_replay_fixed_guards(void)
-{
-	lockdep_assert_held(&zuma_display_mmio_lock);
-
-	return readl(zuma_dpp0.base + ZUMA_DPP_RDMA_SRC_STRIDE_0) == 0 &&
-	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_SRC_STRIDE_0 +
-		     ZUMA_DPP_RDMA_SHADOW_OFFSET) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x080) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x180) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x084) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x184) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x090) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x190) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x094) == 0 &&
-	       readl(zuma_dpp0_dpp.base + 0x194) == 0 ? 0 : -EIO;
-}
-
-static void
-zuma_dpp0_replay_table(enum zuma_dpp0_replay_stage stage,
-		       const struct zuma_dpp0_replay_write **writes,
-		       size_t *count)
-{
-	if (stage == ZUMA_DPP0_REPLAY_IDMA_INIT) {
-		*writes = zuma_dpp0_idma_init_replay;
-		*count = ARRAY_SIZE(zuma_dpp0_idma_init_replay);
-	} else if (stage == ZUMA_DPP0_REPLAY_FIXED_CONFIG) {
-		*writes = zuma_dpp0_fixed_replay;
-		*count = ARRAY_SIZE(zuma_dpp0_fixed_replay);
-	} else {
-		*writes = NULL;
-		*count = 0;
-	}
-}
-
 static int
-zuma_dpp0_replay_final_state_ready(const struct zuma_dpp0_replay_write *writes,
-				   size_t count)
+zuma_dpp0_profile_state_ready(bool include_shadow, bool inherited_boot)
 {
-	size_t i, j;
+	size_t i;
 
-	for (i = 0; i < count; i++) {
-		void __iomem *base = zuma_dpp0_replay_base(writes[i].region);
+	lockdep_assert_held(&zuma_display_mmio_lock);
 
-		for (j = i + 1; j < count; j++)
-			if (zuma_dpp0_replay_same_reg(&writes[i], &writes[j]))
-				break;
-		if (j != count)
-			continue;
-		if (readl(base + writes[i].live) != writes[i].after)
+	for (i = 0; i < ARRAY_SIZE(zuma_dpp0_fixed_profile); i++) {
+		const struct zuma_dpp0_profile_reg *reg =
+			&zuma_dpp0_fixed_profile[i];
+		void __iomem *base = zuma_dpp0_replay_base(reg->region);
+		u32 value = reg->value;
+
+		if (inherited_boot && reg->region == ZUMA_DPP0_REPLAY_DPP &&
+		    reg->live == ZUMA_DPP_CORE_IO_CON)
+			value = ZUMA_DPP_CORE_INHERITED_IO;
+		if (readl(base + reg->live) != value)
 			return -EIO;
-		if (writes[i].shadow != ZUMA_DPP0_NO_SHADOW &&
-		    readl(base + writes[i].shadow) != writes[i].after)
+		if (include_shadow && reg->shadow != ZUMA_DPP0_NO_SHADOW &&
+		    readl(base + reg->shadow) != value)
 			return -EIO;
 	}
 
 	return 0;
+}
+
+static int zuma_dpp0_inherited_boot_profile_ready(void)
+{
+	u32 rdma_irq;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (zuma_dpp0_profile_state_ready(true, true))
+		return -EIO;
+	rdma_irq = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	if (rdma_irq != 0 && rdma_irq != ZUMA_DPP_RDMA_INHERITED_IRQ)
+		return -EIO;
+
+	return readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_SWRST) ||
+	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON) ||
+	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK) !=
+		ZUMA_DPP_CORE_INHERITED_MASK ||
+	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS) ||
+	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_CONFIG_ERROR) ||
+	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_OP_STATUS) ?
+		-EIO : 0;
+}
+
+static int zuma_dpp0_resetless_fixed_live_ready(const char *phase)
+{
+	size_t i;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	for (i = 0; i < ARRAY_SIZE(zuma_dpp0_fixed_profile); i++) {
+		const struct zuma_dpp0_profile_reg *reg =
+			&zuma_dpp0_fixed_profile[i];
+		void __iomem *base = zuma_dpp0_replay_base(reg->region);
+		u32 actual = readl(base + reg->live);
+
+		if (actual != reg->value) {
+			pr_err("zuma-display-handoff: resetless %s %s live[%#x]=%#x expected=%#x\n",
+			       phase, reg->name, reg->live, actual, reg->value);
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
+static int
+zuma_dpp0_resetless_mixed_profile_ready(const char *phase)
+{
+	size_t i;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (zuma_dpp0_resetless_fixed_live_ready(phase))
+		return -EIO;
+	for (i = 0; i < ARRAY_SIZE(zuma_dpp0_fixed_profile); i++) {
+		const struct zuma_dpp0_profile_reg *reg =
+			&zuma_dpp0_fixed_profile[i];
+		void __iomem *base = zuma_dpp0_replay_base(reg->region);
+		u32 actual;
+		u32 expected;
+
+		if (reg->shadow == ZUMA_DPP0_NO_SHADOW)
+			continue;
+		expected = reg->value;
+		if (reg->region == ZUMA_DPP0_REPLAY_DPP &&
+		    reg->live == ZUMA_DPP_CORE_IO_CON)
+			expected = ZUMA_DPP_CORE_INHERITED_IO;
+		actual = readl(base + reg->shadow);
+		if (actual != expected) {
+			pr_err("zuma-display-handoff: resetless %s %s shadow[%#x]=%#x expected=%#x\n",
+			       phase, reg->name, reg->shadow, actual, expected);
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
+static int
+zuma_dpp0_resetless_irq_ready(const char *phase, bool inherited)
+{
+	u32 config_error;
+	u32 irq_con;
+	u32 irq_mask;
+	u32 irq_status;
+	u32 op_status;
+	u32 rdma_irq;
+	u32 swrst;
+	bool rdma_ready;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (zuma_dpp0_resetless_mixed_profile_ready(phase))
+		return -EIO;
+
+	rdma_irq = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	swrst = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_SWRST);
+	irq_con = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON);
+	irq_mask = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
+	irq_status = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS);
+	config_error = readl(zuma_dpp0_dpp.base +
+			     ZUMA_DPP_CORE_CONFIG_ERROR);
+	op_status = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_OP_STATUS);
+	rdma_ready = inherited ?
+		(rdma_irq == 0 || rdma_irq == ZUMA_DPP_RDMA_INHERITED_IRQ) :
+		rdma_irq == ZUMA_DPP_RDMA_OWNED_CONTROL;
+	if (!rdma_ready || swrst ||
+	    irq_con != (inherited ? 0 : ZUMA_DPP_CORE_IRQ_ENABLE) ||
+	    irq_mask != (inherited ? ZUMA_DPP_CORE_INHERITED_MASK :
+				     ZUMA_DPP_CORE_OWNED_MASK) ||
+	    irq_status || config_error || op_status) {
+		pr_err("zuma-display-handoff: resetless %s IRQ gate rdma=%#x expected=%s swrst=%#x con=%#x mask=%#x status=%#x config=%#x op=%#x\n",
+		       phase, rdma_irq,
+		       inherited ? "0|frame-done" : "owned", swrst,
+		       irq_con, irq_mask, irq_status, config_error, op_status);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int zuma_dpp0_resetless_pretrigger_ready(void)
+{
+	return zuma_dpp0_resetless_irq_ready("entry", true);
+}
+
+static int zuma_dpp0_resetless_owned_pretrigger_ready(void)
+{
+	return zuma_dpp0_resetless_irq_ready("owned", false);
 }
 
 static int
@@ -1888,15 +1912,10 @@ zuma_dpp0_irq_profile_ready(u32 rdma_irq, u32 dpp_irq_con,
 {
 	lockdep_assert_held(&zuma_display_mmio_lock);
 
-	if (zuma_dpp0_replay_final_state_ready(zuma_dpp0_idma_init_replay,
-					       ARRAY_SIZE(zuma_dpp0_idma_init_replay)))
-		return -EIO;
-	if (zuma_dpp0_replay_final_state_ready(zuma_dpp0_fixed_replay,
-					       ARRAY_SIZE(zuma_dpp0_fixed_replay)))
+	if (zuma_dpp0_profile_state_ready(true, false))
 		return -EIO;
 
-	return zuma_dpp0_replay_fixed_guards() ||
-	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) !=
+	return readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) !=
 			ZUMA_DPP_RDMA_EXPECTED ||
 	       readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) != rdma_irq ||
 	       readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_SWRST) != 0 ||
@@ -1930,6 +1949,177 @@ static int zuma_dpp0_irq_owned_ready(void)
 	return zuma_dpp0_irq_profile_ready(ZUMA_DPP_RDMA_OWNED_CONTROL,
 					   ZUMA_DPP_CORE_IRQ_ENABLE,
 					   ZUMA_DPP_CORE_OWNED_MASK);
+}
+
+static void zuma_dpp0_resetless_write_profile(void)
+{
+	size_t i;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+
+	for (i = 0; i < ARRAY_SIZE(zuma_dpp0_fixed_profile); i++) {
+		const struct zuma_dpp0_profile_reg *reg =
+			&zuma_dpp0_fixed_profile[i];
+
+		writel(reg->value,
+		       zuma_dpp0_replay_base(reg->region) + reg->live);
+	}
+}
+
+static int
+zuma_dpp0_resetless_quiesce_irqs(struct zuma_drm *zdev,
+				 bool allow_inherited_frame_done)
+{
+	u32 core_control;
+	u32 core_mask;
+	u32 core_status;
+	u32 dma_control;
+	u32 dma_status;
+	u32 unexpected;
+	u32 value;
+	int ret = 0;
+
+	value = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	dma_control = value & ZUMA_DPP_RDMA_CONTROL_MASK;
+	dma_status = value & ZUMA_DPP_RDMA_ALL_IRQ_STATUS;
+	if (dma_status & ZUMA_DPP_RDMA_CONFIG_ERR_IRQ)
+		WRITE_ONCE(zdev->dpp_dma_config_error,
+			   readl(zuma_dpp0.base +
+				 ZUMA_DPP_RDMA_CONFIG_ERR_STATUS));
+	unexpected = dma_status;
+	if (allow_inherited_frame_done)
+		unexpected &= ~ZUMA_DPP_RDMA_FRAME_DONE_IRQ;
+	if (unexpected ||
+	    (value & ~(ZUMA_DPP_RDMA_ALL_IRQ_STATUS |
+		       ZUMA_DPP_RDMA_CONTROL_MASK)) ||
+	    (dma_control != 0 &&
+	     dma_control != ZUMA_DPP_RDMA_MASKED_CONTROL)) {
+		atomic_or(unexpected, &zdev->dpp_dma_error_status);
+		ret = -EIO;
+	}
+	writel(ZUMA_DPP_RDMA_MASKED_CONTROL | dma_status,
+	       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) !=
+	    ZUMA_DPP_RDMA_MASKED_CONTROL)
+		ret = -EIO;
+
+	core_control = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON);
+	core_mask = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
+	core_status = readl(zuma_dpp0_dpp.base +
+			    ZUMA_DPP_CORE_IRQ_STATUS);
+	if (core_control || (core_mask & ~ZUMA_DPP_CORE_MASKED_MASK))
+		ret = -EIO;
+	if (core_status & ZUMA_DPP_CORE_CONFIG_ERR_IRQ)
+		WRITE_ONCE(zdev->dpp_core_config_error,
+			   readl(zuma_dpp0_dpp.base +
+				 ZUMA_DPP_CORE_CONFIG_ERROR));
+	if (core_status) {
+		atomic_or(core_status, &zdev->dpp_core_error_status);
+		ret = -EIO;
+	}
+	writel(ZUMA_DPP_CORE_MASKED_MASK,
+	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
+	if (core_status & ZUMA_DPP_CORE_ALL_IRQ_STATUS)
+		writel(core_status & ZUMA_DPP_CORE_ALL_IRQ_STATUS,
+		       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS);
+	writel(0, zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON);
+	if (readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK) !=
+		ZUMA_DPP_CORE_MASKED_MASK ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS) ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON))
+		ret = -EIO;
+
+	return ret;
+}
+
+static int
+zuma_dpp0_resetless_init(struct zuma_drm *zdev, bool *profile_started)
+{
+	u64 deadlock;
+	u32 rcv_ctrl;
+	u32 rcv_num;
+	u32 rdma_irq;
+	int ret;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (zuma_dpp0_irq_owner_state(zdev) != ZUMA_DPP0_IRQ_INHERITED ||
+	    zdev->dpp_irq_routes_enabled ||
+	    readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) &
+		ZUMA_DPP_RDMA_BUSY ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_OP_STATUS))
+		return -EIO;
+
+	rdma_irq = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	if (rdma_irq & ZUMA_DPP_RDMA_DEADLOCK_IRQ) {
+		atomic_or(ZUMA_DPP_RDMA_DEADLOCK_IRQ,
+			  &zdev->dpp_dma_error_status);
+		return -EIO;
+	}
+	if (zuma_dpp0_inherited_boot_profile_ready())
+		return -EIO;
+
+	rcv_ctrl = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_RECOVERY_CTRL);
+	if ((rcv_ctrl & ZUMA_DPP_RDMA_RECOVERY_ENABLE) ||
+	    !(rcv_ctrl & ZUMA_DPP_RDMA_COUNT_MASK))
+		return -EIO;
+	rcv_num = (rcv_ctrl & ZUMA_DPP_RDMA_COUNT_MASK) >> 1;
+	deadlock = ((u64)rcv_num * 51 << 1) |
+		   ZUMA_DPP_RDMA_DEADLOCK_ENABLE;
+	if (deadlock > U32_MAX ||
+	    readl(zuma_dpp0.base + ZUMA_DPP_RDMA_DEADLOCK_CTRL) !=
+		(u32)deadlock)
+		return -EIO;
+
+	zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_ACQUIRING);
+	ret = zuma_dpp0_resetless_quiesce_irqs(zdev, true);
+	if (ret)
+		return ret;
+	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) !=
+		ZUMA_DPP_RDMA_EXPECTED ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_SWRST) ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_OP_STATUS) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ))
+		return -EIO;
+
+	*profile_started = true;
+	zuma_dpp0_resetless_write_profile();
+	if (zuma_dpp0_resetless_fixed_live_ready("post-write"))
+		return -EIO;
+
+	ret = zuma_dpp0_resetless_quiesce_irqs(zdev, false);
+	if (ret)
+		return ret;
+	writel(0, zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	writel(ZUMA_DPP_CORE_INHERITED_MASK,
+	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
+	if (readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ) ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON) ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK) !=
+		ZUMA_DPP_CORE_INHERITED_MASK ||
+	    readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS))
+		return -EIO;
+
+	zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_INHERITED);
+	pr_info("zuma-display-handoff: resetless DPP0 fixed live initialization ready rcv=%u\n",
+		rcv_num);
+	return 0;
+}
+
+static int zuma_dpp0_resetless_fail_quiesce(struct zuma_drm *zdev)
+{
+	int ret;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (zdev->dpp_irq_routes_enabled) {
+		disable_irq_nosync(zdev->dpp_core_irq);
+		disable_irq_nosync(zdev->dpp_dma_irq);
+		zdev->dpp_irq_routes_enabled = false;
+		synchronize_irq(zdev->dpp_core_irq);
+		synchronize_irq(zdev->dpp_dma_irq);
+	}
+	ret = zuma_dpp0_resetless_quiesce_irqs(zdev, false);
+	zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_BROKEN);
+	return ret;
 }
 
 static void
@@ -2054,6 +2244,9 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_MASK);
 	restored = !zuma_dpp0_irq_profile_ready(0, 0,
 						ZUMA_DPP_CORE_INHERITED_MASK);
+	if (!restored &&
+	    zdev->replay_stage == ZUMA_DPP0_REPLAY_RESETLESS_INIT)
+		restored = !zuma_dpp0_inherited_boot_profile_ready();
 	zuma_dpp0_set_irq_owner_state(zdev, restored ?
 				      ZUMA_DPP0_IRQ_INHERITED :
 				      ZUMA_DPP0_IRQ_BROKEN);
@@ -2064,7 +2257,8 @@ static int zuma_dpp0_irq_restore(struct zuma_drm *zdev)
 
 static int
 zuma_dpp0_irq_prepare(struct zuma_drm *zdev,
-		      struct zuma_drm_irq_proof *proof)
+		      struct zuma_drm_irq_proof *proof,
+		      bool resetless_pretrigger)
 {
 	u32 inherited_status;
 	u32 inherited_value;
@@ -2072,7 +2266,10 @@ zuma_dpp0_irq_prepare(struct zuma_drm *zdev,
 	lockdep_assert_held(&zuma_display_mmio_lock);
 	if (!zuma_drm_irq_proof_is_armed(zdev) ||
 	    zdev->dpp_irq_routes_enabled ||
-	    zuma_dpp0_irq_owner_state(zdev) != ZUMA_DPP0_IRQ_INHERITED ||
+	    zuma_dpp0_irq_owner_state(zdev) != ZUMA_DPP0_IRQ_INHERITED)
+		return -EIO;
+	if (resetless_pretrigger ?
+	    zuma_dpp0_resetless_pretrigger_ready() :
 	    zuma_dpp0_irq_inherited_ready())
 		return -EIO;
 
@@ -2110,7 +2307,9 @@ zuma_dpp0_irq_prepare(struct zuma_drm *zdev,
 	       zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
 	writel(ZUMA_DPP_CORE_IRQ_ENABLE,
 	       zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_CON);
-	if (zuma_dpp0_irq_owned_ready())
+	if (resetless_pretrigger ?
+	    zuma_dpp0_resetless_owned_pretrigger_ready() :
+	    zuma_dpp0_irq_owned_ready())
 		return -EIO;
 
 	zdev->dpp_irq_routes_enabled = true;
@@ -2146,16 +2345,11 @@ static void zuma_drm_dpp_irq_fault_work(struct work_struct *work)
 static int
 zuma_dpp0_replay_prepare(struct zuma_drm *zdev, const char *operation,
 			 u32 *replay_frame,
-			 struct zuma_drm_irq_proof *proof)
+			 struct zuma_drm_irq_proof *proof,
+			 bool *profile_started)
 {
-	const struct zuma_dpp0_replay_write *writes;
 	enum zuma_dpp0_replay_stage stage = zdev->replay_stage;
-	const char *aperture = "live";
-	size_t count;
-	size_t i, j;
-	u32 actual;
-	u32 expected;
-	u32 next;
+	int ret;
 
 	lockdep_assert_held(&zuma_display_mmio_lock);
 	if (stage >= ZUMA_DPP0_REPLAY_DONE)
@@ -2164,75 +2358,23 @@ zuma_dpp0_replay_prepare(struct zuma_drm *zdev, const char *operation,
 	*replay_frame = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
 	if (readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ))
 		goto fail_profile;
-	if (stage == ZUMA_DPP0_REPLAY_IRQ_TAKEOVER) {
-		if (zuma_dpp0_irq_prepare(zdev, proof))
-			goto fail_profile;
-		return 0;
-	}
 
-	zuma_dpp0_replay_table(stage, &writes, &count);
-	if (zuma_dpp0_replay_status_ready() ||
-	    (stage == ZUMA_DPP0_REPLAY_FIXED_CONFIG &&
-	     zuma_dpp0_replay_fixed_guards()))
+	if (stage == ZUMA_DPP0_REPLAY_RESETLESS_INIT) {
+		ret = zuma_dpp0_resetless_init(zdev, profile_started);
+		if (!ret)
+			ret = zuma_dpp0_irq_prepare(zdev, proof, true);
+	} else {
+		ret = -EIO;
+	}
+	if (ret)
 		goto fail_profile;
-
-	/* Validate the complete initial state before issuing the first write. */
-	for (i = 0; i < count; i++) {
-		void __iomem *base = zuma_dpp0_replay_base(writes[i].region);
-
-		for (j = 0; j < i; j++)
-			if (zuma_dpp0_replay_same_reg(&writes[i], &writes[j]))
-				break;
-		if (j != i)
-			continue;
-		aperture = "live";
-		expected = writes[i].before;
-		actual = readl(base + writes[i].live);
-		if (actual != expected)
-			goto fail_register;
-		if (writes[i].shadow != ZUMA_DPP0_NO_SHADOW) {
-			aperture = "shadow";
-			actual = readl(base + writes[i].shadow);
-			if (actual != expected)
-				goto fail_register;
-		}
-	}
-
-	for (i = 0; i < count; i++) {
-		void __iomem *base = zuma_dpp0_replay_base(writes[i].region);
-
-		aperture = "live-before-write";
-		expected = writes[i].before;
-		actual = readl(base + writes[i].live);
-		if (actual != expected)
-			goto fail_register;
-		next = (actual & ~writes[i].mask) |
-		       (writes[i].value & writes[i].mask);
-		aperture = "composed-value";
-		expected = writes[i].after;
-		actual = next;
-		if (actual != expected)
-			goto fail_register;
-		writel(next, base + writes[i].live);
-		aperture = "live-after-write";
-		actual = readl(base + writes[i].live);
-		if (actual != expected)
-			goto fail_register;
-	}
-
 	if (readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT) != *replay_frame ||
 	    readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ))
 		goto fail_profile;
 	return 0;
 
-fail_register:
-	pr_err("zuma-display-handoff: R35 replay %s %s pre-trigger register failure index=%zu name=%s aperture=%s actual=%#x expected=%#x mask=%#x poison=yes\n",
-	       zuma_dpp0_replay_stage_name(stage), operation, i,
-	       writes[i].name, aperture, actual, expected, writes[i].mask);
-	return -EIO;
-
 fail_profile:
-	pr_err("zuma-display-handoff: R35 replay %s %s pre-trigger profile failure frame=%#x poison=yes\n",
+	pr_err("zuma-display-handoff: DPP0 stage %s %s pre-trigger profile failure frame=%#x poison=yes\n",
 	       zuma_dpp0_replay_stage_name(stage), operation, *replay_frame);
 	return -EIO;
 }
@@ -2241,109 +2383,58 @@ static int
 zuma_dpp0_replay_complete(struct zuma_drm *zdev, const char *operation,
 			  u32 replay_frame, u32 frame_after,
 			  const struct zuma_drm_irq_proof *proof,
-			  bool release_after_frame)
+			  bool release_after_frame,
+			  bool profile_started)
 {
-	const struct zuma_dpp0_replay_write *writes;
 	enum zuma_dpp0_replay_stage stage = zdev->replay_stage;
-	const char *aperture = "live";
-	size_t count;
-	size_t i, j;
-	u32 actual;
-	u32 expected;
 
 	lockdep_assert_held(&zuma_display_mmio_lock);
 	if (stage >= ZUMA_DPP0_REPLAY_DONE)
 		return 0;
-	if (stage == ZUMA_DPP0_REPLAY_IRQ_TAKEOVER) {
-		if (frame_after != replay_frame + 1 ||
-		    !proof->dpp_irq_active ||
-		    proof->dpp_dma_after != proof->dpp_dma_before + 1 ||
-		    proof->dpp_core_after != proof->dpp_core_before + 1 ||
-		    READ_ONCE(zdev->dpp_dma_status) !=
-			ZUMA_DPP_RDMA_FRAME_DONE_IRQ ||
-		    READ_ONCE(zdev->dpp_core_status) !=
-			ZUMA_DPP_CORE_FRAME_DONE_IRQ ||
-		    READ_ONCE(zdev->dpp_dma_config_error) ||
-		    READ_ONCE(zdev->dpp_core_config_error) ||
-		    atomic_read(&zdev->dpp_dma_error_status) ||
-		    atomic_read(&zdev->dpp_core_error_status))
-			goto fail_profile;
-		if (release_after_frame) {
-			if (!proof->dpp_irq_released ||
-			    zuma_dpp0_irq_owner_state(zdev) !=
-				ZUMA_DPP0_IRQ_INHERITED ||
-			    zuma_dpp0_irq_restored_ready())
-				goto fail_profile;
-		} else {
-			if (proof->dpp_irq_released ||
-			    zuma_dpp0_irq_owner_state(zdev) !=
-				ZUMA_DPP0_IRQ_ACQUIRING ||
-			    zuma_dpp0_irq_owned_ready())
-				goto fail_profile;
-			zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_OWNED);
-		}
-		zdev->replay_stage++;
-		pr_info("zuma-display-handoff: persistent DPP0 IRQ takeover proven on %s frame=%#x->%#x dma=%llu->%llu status=%#x dpp=%llu->%llu status=%#x owner=%s next=%s\n",
-			operation, replay_frame, frame_after,
-			(unsigned long long)proof->dpp_dma_before,
-			(unsigned long long)proof->dpp_dma_after,
-			READ_ONCE(zdev->dpp_dma_status),
-			(unsigned long long)proof->dpp_core_before,
-			(unsigned long long)proof->dpp_core_after,
-			READ_ONCE(zdev->dpp_core_status),
-			release_after_frame ? "released" : "active",
-			zuma_dpp0_replay_stage_name(zdev->replay_stage));
-		return 0;
-	}
-	if (frame_after != replay_frame + 1 ||
-	    zuma_dpp0_replay_status_ready() ||
-	    (stage == ZUMA_DPP0_REPLAY_FIXED_CONFIG &&
-	     zuma_dpp0_replay_fixed_guards()))
+	if (stage != ZUMA_DPP0_REPLAY_RESETLESS_INIT ||
+	    !profile_started || frame_after != replay_frame + 1 ||
+	    !proof->dpp_irq_active ||
+	    proof->dpp_dma_after != proof->dpp_dma_before + 1 ||
+	    proof->dpp_core_after != proof->dpp_core_before + 1 ||
+	    READ_ONCE(zdev->dpp_dma_status) !=
+		ZUMA_DPP_RDMA_FRAME_DONE_IRQ ||
+	    READ_ONCE(zdev->dpp_core_status) !=
+		ZUMA_DPP_CORE_FRAME_DONE_IRQ ||
+	    READ_ONCE(zdev->dpp_dma_config_error) ||
+	    READ_ONCE(zdev->dpp_core_config_error) ||
+	    atomic_read(&zdev->dpp_dma_error_status) ||
+	    atomic_read(&zdev->dpp_core_error_status))
 		goto fail_profile;
-
-	zuma_dpp0_replay_table(stage, &writes, &count);
-	for (i = 0; i < count; i++) {
-		void __iomem *base = zuma_dpp0_replay_base(writes[i].region);
-
-		for (j = i + 1; j < count; j++)
-			if (zuma_dpp0_replay_same_reg(&writes[i], &writes[j]))
-				break;
-		if (j != count)
-			continue;
-		expected = writes[i].after;
-		aperture = "live";
-		actual = readl(base + writes[i].live);
-		if (actual != expected)
-			goto fail_register;
-		if (writes[i].shadow != ZUMA_DPP0_NO_SHADOW) {
-			aperture = "shadow";
-			actual = readl(base + writes[i].shadow);
-			if (actual != expected)
-				goto fail_register;
-		}
+	if (release_after_frame) {
+		if (!proof->dpp_irq_released ||
+		    zuma_dpp0_irq_owner_state(zdev) !=
+			ZUMA_DPP0_IRQ_INHERITED ||
+		    zuma_dpp0_irq_restored_ready())
+			goto fail_profile;
+	} else {
+		if (proof->dpp_irq_released ||
+		    zuma_dpp0_irq_owner_state(zdev) !=
+			ZUMA_DPP0_IRQ_ACQUIRING ||
+		    zuma_dpp0_irq_owned_ready())
+			goto fail_profile;
+		zuma_dpp0_set_irq_owner_state(zdev, ZUMA_DPP0_IRQ_OWNED);
 	}
 
 	zdev->replay_stage++;
-	pr_info("zuma-display-handoff: R35 replay %s proven on %s writes=%zu frame=%#x->%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu next=%s\n",
-		zuma_dpp0_replay_stage_name(stage), operation, count,
-		replay_frame, frame_after,
-		(unsigned long long)proof->frame_start_before,
-		(unsigned long long)proof->frame_start_after,
-		(unsigned long long)proof->frame_done_before,
-		(unsigned long long)proof->frame_done_after,
-		(unsigned long long)proof->vblank_before,
-		(unsigned long long)proof->vblank_after,
+	pr_info("zuma-display-handoff: resetless DPP0 fixed initialization and persistent IRQ takeover proven on %s frame=%#x->%#x dma=%llu->%llu status=%#x dpp=%llu->%llu status=%#x owner=%s next=%s\n",
+		operation, replay_frame, frame_after,
+		(unsigned long long)proof->dpp_dma_before,
+		(unsigned long long)proof->dpp_dma_after,
+		READ_ONCE(zdev->dpp_dma_status),
+		(unsigned long long)proof->dpp_core_before,
+		(unsigned long long)proof->dpp_core_after,
+		READ_ONCE(zdev->dpp_core_status),
+		release_after_frame ? "released" : "active",
 		zuma_dpp0_replay_stage_name(zdev->replay_stage));
 	return 0;
 
-fail_register:
-	pr_err("zuma-display-handoff: R35 replay %s %s post-frame register failure index=%zu name=%s aperture=%s actual=%#x expected=%#x poison=yes\n",
-	       zuma_dpp0_replay_stage_name(stage), operation, i,
-	       writes[i].name, aperture, actual, expected);
-	return -EIO;
-
 fail_profile:
-	pr_err("zuma-display-handoff: R35 replay %s %s post-frame profile failure frame=%#x->%#x poison=yes\n",
+	pr_err("zuma-display-handoff: DPP0 stage %s %s post-frame profile failure frame=%#x->%#x poison=yes\n",
 	       zuma_dpp0_replay_stage_name(stage), operation, replay_frame,
 	       frame_after);
 	return -EIO;
@@ -2653,11 +2744,28 @@ static bool zuma_display_update_ready(void)
 						  ZUMA_DECON_INT_QUIESCENT);
 }
 
+static bool zuma_dpp0_resetless_preflight_ready(struct zuma_drm *zdev)
+{
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (!zdev)
+		return false;
+	if (zdev->replay_stage != ZUMA_DPP0_REPLAY_RESETLESS_INIT)
+		return true;
+
+	return zuma_dpp0_irq_owner_state(zdev) == ZUMA_DPP0_IRQ_INHERITED &&
+	       !zdev->dpp_irq_routes_enabled &&
+	       !zuma_dpp0_inherited_boot_profile_ready() &&
+	       !(readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE) &
+		 ZUMA_DPP_RDMA_BUSY) &&
+	       !readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_OP_STATUS);
+}
+
 static bool zuma_drm_scanout_update_ready(void)
 {
 	return zuma_boot_buffer && zuma_scanout_buffer &&
 	       zuma_framebuffer_phys == ZUMA_SCANOUT_FB_BASE &&
 	       !READ_ONCE(zuma_drm_update_failed) &&
+	       zuma_dpp0_resetless_preflight_ready(zuma_drm_device) &&
 	       (zuma_display_update_ready() ||
 		zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
 						   zuma_framebuffer_ctrl,
@@ -2908,6 +3016,7 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	bool replay_pending = replay_stage < ZUMA_DPP0_REPLAY_DONE;
 	bool replay_started = false;
 	bool lifecycle_started = false;
+	bool profile_started = false;
 	bool trigger_issued = false;
 	bool vblank_ref = false;
 	int cleanup_ret;
@@ -2934,13 +3043,13 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	if (replay_pending) {
 		replay_started = true;
 		ret = zuma_dpp0_replay_prepare(zdev, operation, &replay_frame,
-					       &proof);
+					       &proof, &profile_started);
 		if (ret)
 			goto out_abort;
 	} else if (zuma_dpp0_irq_owner_state(zdev) ==
 		   ZUMA_DPP0_IRQ_INHERITED) {
 		lifecycle_started = true;
-		ret = zuma_dpp0_irq_prepare(zdev, &proof);
+		ret = zuma_dpp0_irq_prepare(zdev, &proof, false);
 		if (ret)
 			goto out_abort;
 	}
@@ -2971,7 +3080,8 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 		}
 		ret = zuma_dpp0_replay_complete(zdev, operation, replay_frame,
 						frame_after, &proof,
-						release_after_frame);
+						release_after_frame,
+						profile_started);
 		if (ret)
 			goto out_abort;
 	} else if (lifecycle_started && !release_after_frame) {
@@ -3011,7 +3121,10 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 out_abort:
 	zuma_display_set_hw_trigger(false);
 	cleanup_ret = zuma_drm_quiesce_irq_proof(zdev, true);
-	restore_ret = zuma_dpp0_irq_restore(zdev);
+	if (profile_started)
+		restore_ret = zuma_dpp0_resetless_fail_quiesce(zdev);
+	else
+		restore_ret = zuma_dpp0_irq_restore(zdev);
 	if (!ret)
 		ret = cleanup_ret ? cleanup_ret : restore_ret;
 	if (vblank_ref)
@@ -3022,10 +3135,13 @@ out_abort:
 		ret = -EIO;
 	WRITE_ONCE(zuma_drm_update_failed, true);
 	if (replay_started || lifecycle_started)
-		pr_err("zuma-display-handoff: DPP0 stage %s failed stage-unchanged trigger-issued=%s outcome=%s owner=%u restore=%s poison=yes\n",
+		pr_err("zuma-display-handoff: DPP0 stage %s failed stage-unchanged profile-started=%s trigger-issued=%s outcome=%s owner=%u restore=%s poison=yes\n",
 		       zuma_dpp0_replay_stage_name(replay_stage),
+		       profile_started ? "yes" : "no",
 		       trigger_issued ? "yes" : "no",
-		       trigger_issued ? "uncertain" : "visible-frame-preserved",
+		       profile_started ? "fixed-state-uncertain" :
+		       trigger_issued ? "frame-uncertain" :
+		       "visible-frame-preserved",
 		       zuma_dpp0_irq_owner_state(zdev),
 		       restore_ret ? "failed" : "ok");
 	pr_err("zuma-display-handoff: DRM %s failed closed: %d, frame=%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu\n",
