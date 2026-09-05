@@ -37,6 +37,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_damage_helper.h>
@@ -112,7 +113,14 @@
 #define ZUMA_DECON_GLOBAL_CONFIG        ZUMA_DECON_GLOBAL_COMMAND
 #define ZUMA_DECON_GLOBAL_EXPECTED      0x0133
 #define ZUMA_DECON_GLOBAL_IDLE          BIT(5)
+#define ZUMA_DECON_GLOBAL_RUN           BIT(4)
+#define ZUMA_DECON_GLOBAL_EN            BIT(1)
+#define ZUMA_DECON_GLOBAL_EN_F          BIT(0)
+#define ZUMA_DECON_SHD_REQ_GLOBAL       (BIT(31) | BIT(20))
+#define ZUMA_DECON_PLL_SLEEP_CON        0x0410
+#define ZUMA_DECON_PLL_SLEEP_ENABLE     BIT(0)
 #define ZUMA_DECON_TRIG_CON             0x0030
+#define ZUMA_DECON_HW_TE_COUNT          0x0038
 #define ZUMA_DECON_TRIG_HW_SELECT_MASK  GENMASK(25, 24)
 #define ZUMA_DECON_TRIG_SW_EN           BIT(8)
 #define ZUMA_DECON_TRIG_HW_MASK         BIT(4)
@@ -490,6 +498,8 @@ struct zuma_drm {
 	struct notifier_block reboot_notifier;
 	/* Physical shadow matches the preceding commit; protected by MMIO lock. */
 	bool shadow_valid;
+	/* Boot-time diagnostic is consumed once, even if its preflight fails. */
+	bool crtc_probe_attempted;
 };
 
 struct zuma_drm_irq_proof {
@@ -521,6 +531,11 @@ static const u32 *zuma_boot_buffer __ro_after_init;
 static void *zuma_scanout_buffer __ro_after_init;
 static struct device *zuma_drm_root;
 static struct zuma_drm *zuma_drm_device;
+
+static bool zuma_crtc_roundtrip;
+module_param_named(crtc_roundtrip, zuma_crtc_roundtrip, bool, 0400);
+MODULE_PARM_DESC(crtc_roundtrip,
+		 "Probe resetless DECON stop/start before the second DRM frame");
 
 /*
  * Adopt the boot chain's fixed HK3 mode.  Its existing command-mode stream
@@ -940,6 +955,9 @@ static DECLARE_DELAYED_WORK(zuma_display_snapshot_work,
 
 static const u32 zuma_drm_primary_plane_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
 };
 
 static enum drm_connector_status
@@ -954,17 +972,31 @@ static int zuma_drm_connector_get_modes(struct drm_connector *connector)
 						    &zuma_drm_fixed_mode);
 }
 
+static bool zuma_drm_fb_format_supported(u32 format)
+{
+	switch (format) {
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool zuma_drm_fb_layout_valid(struct drm_framebuffer *fb)
 {
 	struct drm_gem_object *obj;
 	u64 required;
 
 	if (fb->pitches[0] < ZUMA_HANDOFF_FB_STRIDE ||
-	    fb->pitches[0] % sizeof(u32) || fb->offsets[0])
+	    fb->pitches[0] % sizeof(u32) || fb->offsets[0] % sizeof(u32))
 		return false;
 
 	/* Check the final visible byte in u64, including for imported buffers. */
-	required = (u64)(ZUMA_HANDOFF_FB_HEIGHT - 1) * fb->pitches[0] +
+	required = (u64)fb->offsets[0] +
+		   (u64)(ZUMA_HANDOFF_FB_HEIGHT - 1) * fb->pitches[0] +
 		   ZUMA_HANDOFF_FB_STRIDE;
 	obj = drm_gem_fb_get_obj(fb, 0);
 	return obj && required <= obj->size;
@@ -1018,7 +1050,7 @@ static int zuma_drm_primary_plane_atomic_check(struct drm_plane *plane,
 		return -EINVAL;
 
 	fb = new_plane_state->fb;
-	if (fb->format->format != DRM_FORMAT_XRGB8888 ||
+	if (!zuma_drm_fb_format_supported(fb->format->format) ||
 	    fb->format->num_planes != 1 ||
 	    fb->modifier != DRM_FORMAT_MOD_LINEAR ||
 	    fb->width != ZUMA_HANDOFF_FB_WIDTH ||
@@ -1030,7 +1062,9 @@ static int zuma_drm_primary_plane_atomic_check(struct drm_plane *plane,
 	    new_plane_state->crtc_x || new_plane_state->crtc_y ||
 	    new_plane_state->crtc_w != ZUMA_HANDOFF_FB_WIDTH ||
 	    new_plane_state->crtc_h != ZUMA_HANDOFF_FB_HEIGHT ||
-	    new_plane_state->rotation != DRM_MODE_ROTATE_0)
+	    new_plane_state->rotation != DRM_MODE_ROTATE_0 ||
+	    new_plane_state->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE ||
+	    new_plane_state->alpha != DRM_BLEND_ALPHA_OPAQUE)
 		return -EINVAL;
 
 	return 0;
@@ -1108,11 +1142,21 @@ static const struct drm_plane_helper_funcs zuma_drm_primary_plane_helper_funcs =
 	.atomic_update = zuma_drm_primary_plane_atomic_update,
 };
 
+static void zuma_drm_primary_plane_reset(struct drm_plane *plane)
+{
+	drm_gem_reset_shadow_plane(plane);
+	/* Generic reset defaults to premultiplied; this plane ignores alpha. */
+	if (plane->state)
+		plane->state->pixel_blend_mode = DRM_MODE_BLEND_PIXEL_NONE;
+}
+
 static const struct drm_plane_funcs zuma_drm_primary_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
-	DRM_GEM_SHADOW_PLANE_FUNCS,
+	.reset = zuma_drm_primary_plane_reset,
+	.atomic_duplicate_state = drm_gem_duplicate_shadow_plane_state,
+	.atomic_destroy_state = drm_gem_destroy_shadow_plane_state,
 };
 
 static int zuma_drm_crtc_enable_vblank(struct drm_crtc *crtc);
@@ -1682,6 +1726,10 @@ static int zuma_drm_register(void)
 	drm_plane_helper_add(&zdev->primary_plane,
 			     &zuma_drm_primary_plane_helper_funcs);
 	drm_plane_enable_fb_damage_clips(&zdev->primary_plane);
+	ret = drm_plane_create_blend_mode_property(&zdev->primary_plane,
+						   BIT(DRM_MODE_BLEND_PIXEL_NONE));
+	if (ret)
+		goto err_unregister_root;
 
 	ret = drm_crtc_init_with_planes(drm, &zdev->crtc,
 					&zdev->primary_plane, NULL,
@@ -2324,12 +2372,15 @@ static int zuma_decon_capture_protected(struct zuma_drm *zdev)
 	return 0;
 }
 
-static bool zuma_decon_protected_ready(struct zuma_drm *zdev)
+static bool zuma_decon_protected_ready_for_update(struct zuma_drm *zdev,
+						  bool crtc_restart)
 {
 	struct zuma_decon_protected_state *saved = &zdev->decon_protected;
 	const struct zuma_decon_entry_reg *reg;
 	void __iomem *base;
 	u32 offset;
+	u32 request = 0;
+	u32 shadow;
 	unsigned int block;
 	unsigned int i;
 
@@ -2337,13 +2388,33 @@ static bool zuma_decon_protected_ready(struct zuma_drm *zdev)
 	    readl(zuma_decon0.base + ZUMA_DECON_INT_TIMEOUT_VAL) !=
 		saved->timeout_value)
 		return false;
+	if (crtc_restart) {
+		request = readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+		if ((request & ~ZUMA_DECON_SHD_REQ_GLOBAL) ||
+		    readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON) !=
+			ZUMA_DECON_GLOBAL_EXPECTED ||
+		    readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) !=
+			ZUMA_DECON_TRIG_EXPECTED)
+			return false;
+	}
 	for (i = 0; i < ARRAY_SIZE(zuma_decon_entry_profile); i++) {
 		reg = &zuma_decon_entry_profile[i];
 		base = zuma_decon_profile_base(reg->region);
 		if (readl(base + reg->live) != saved->profile_live[i])
 			return false;
-		if (reg->shadow != ZUMA_DECON_NO_SHADOW &&
-		    readl(base + reg->shadow) != saved->profile_shadow[i])
+		if (reg->shadow == ZUMA_DECON_NO_SHADOW)
+			continue;
+		shadow = readl(base + reg->shadow);
+		if (shadow == saved->profile_shadow[i])
+			continue;
+		/* EN_F may latch only with the first HW_TE after RUN-on. */
+		if (!crtc_restart || !(request & BIT(31)) ||
+		    reg->region != ZUMA_DECON_PROFILE_MAIN ||
+		    reg->live != ZUMA_DECON_GLOBAL_CON ||
+		    reg->shadow != ZUMA_DECON_GLOBAL_CON + ZUMA_DECON_SHADOW_OFFSET ||
+		    saved->profile_shadow[i] !=
+			(ZUMA_DECON_GLOBAL_CONFIG | ZUMA_DECON_GLOBAL_EN_F) ||
+		    shadow != ZUMA_DECON_GLOBAL_CONFIG)
 			return false;
 	}
 
@@ -2393,6 +2464,11 @@ static bool zuma_decon_protected_ready(struct zuma_drm *zdev)
 		}
 	}
 	return true;
+}
+
+static bool zuma_decon_protected_ready(struct zuma_drm *zdev)
+{
+	return zuma_decon_protected_ready_for_update(zdev, false);
 }
 
 static u32 zuma_decon_wincon_read(unsigned int window)
@@ -3475,48 +3551,137 @@ static void zuma_display_set_hw_trigger(bool unmask)
 	writel(value, zuma_decon0.base + ZUMA_DECON_TRIG_CON);
 }
 
-static int zuma_display_wait_idle(void)
+static int zuma_display_wait_idle_stage(const char **stage, u32 *last)
 {
 	u32 value;
 	int ret;
 
+	*stage = "decon-idle";
 	ret = readl_poll_timeout_atomic(zuma_decon0.base +
 			ZUMA_DECON_GLOBAL_CON, value,
-			value & ZUMA_DECON_GLOBAL_IDLE, 10, 100000);
+		value & ZUMA_DECON_GLOBAL_IDLE, 10, 100000);
+	*last = value;
 	if (ret)
 		return ret;
 
+	*stage = "dpp-idle";
 	ret = readl_poll_timeout_atomic(zuma_dpp0.base +
 			ZUMA_DPP_RDMA_ENABLE, value,
-			!(value & ZUMA_DPP_RDMA_BUSY), 10, 100000);
+		!(value & ZUMA_DPP_RDMA_BUSY), 10, 100000);
+	*last = value;
 	if (ret)
 		return ret;
 
+	*stage = "dsim-link-idle";
 	ret = readl_poll_timeout_atomic(zuma_dsim0.base +
 			ZUMA_DSIM_LINK_STATUS1, value,
-			!(value & ZUMA_DSIM_LINK_CMD_ACTIVE), 10, 100000);
+		!(value & ZUMA_DSIM_LINK_CMD_ACTIVE), 10, 100000);
+	*last = value;
 	if (ret)
 		return ret;
 
-	return readl_poll_timeout_atomic(zuma_dsim0.base +
+	*stage = "dsim-mipi-idle";
+	ret = readl_poll_timeout_atomic(zuma_dsim0.base +
 			ZUMA_DSIM_MIPI_STATUS, value,
-			!(value & ZUMA_DSIM_MIPI_FRAME_PROCESSING), 10, 100000);
+		!(value & ZUMA_DSIM_MIPI_FRAME_PROCESSING), 10, 100000);
+	*last = value;
+	return ret;
 }
 
-static int zuma_display_request_active_window(void)
+static int zuma_display_wait_idle(void)
 {
-	writel(ZUMA_DECON_SHD_REQ_ACTIVE,
+	const char *stage;
+	u32 last;
+
+	return zuma_display_wait_idle_stage(&stage, &last);
+}
+
+static int zuma_display_request_active_window(u32 pending_global)
+{
+	u32 request, requested;
+
+	if (pending_global & ~ZUMA_DECON_SHD_REQ_GLOBAL)
+		return -EINVAL;
+	/* GLOBAL/CMP may self-clear before the window request is submitted. */
+	request = readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	if (request & ~pending_global)
+		return -EIO;
+
+	/* Match CAL's RMW: do not replace pending GLOBAL/CMP with just WIN5. */
+	requested = request | ZUMA_DECON_SHD_REQ_ACTIVE;
+	writel(requested,
 	       zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
-	if (readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ) !=
-	    ZUMA_DECON_SHD_REQ_ACTIVE)
+	request = readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	if (!(request & ZUMA_DECON_SHD_REQ_ACTIVE) ||
+	    (request & ~requested))
 		return -EIO;
 
 	return 0;
 }
 
+struct zuma_frame_diagnostic {
+	bool valid;
+	u32 frame, te, trigger, global, shadow, request;
+	u32 pending, extra, int_en, extra_en;
+	u32 dma_enable, dma_irq, core_irq, link, mipi;
+	u64 start, done, vblank, dma, core;
+};
+
+static void zuma_display_sample_frame(struct zuma_frame_diagnostic *s)
+{
+	struct zuma_drm *zdev = zuma_drm_device;
+	u32 dpub, dpuf0, dpuf1;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	if (!zdev || !zuma_display_domains_on(&dpub, &dpuf0, &dpuf1))
+		return;
+
+	s->frame = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	/* CAL names two 16-bit counters here; their enable semantics are unknown. */
+	s->te = readl(zuma_decon0.base + ZUMA_DECON_HW_TE_COUNT);
+	s->trigger = readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON);
+	s->global = readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON);
+	s->shadow = readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON +
+			 ZUMA_DECON_SHADOW_OFFSET);
+	s->request = readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	s->pending = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND);
+	s->extra = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND_EXTRA);
+	s->int_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN);
+	s->extra_en = readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA);
+	s->dma_enable = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_ENABLE);
+	s->dma_irq = readl(zuma_dpp0.base + ZUMA_DPP_RDMA_IRQ);
+	s->core_irq = readl(zuma_dpp0_dpp.base + ZUMA_DPP_CORE_IRQ_STATUS);
+	s->link = readl(zuma_dsim0.base + ZUMA_DSIM_LINK_STATUS1);
+	s->mipi = readl(zuma_dsim0.base + ZUMA_DSIM_MIPI_STATUS);
+	s->start = atomic64_read(&zdev->frame_start_irq_count);
+	s->done = atomic64_read(&zdev->frame_done_irq_count);
+	s->vblank = drm_crtc_vblank_count(&zdev->crtc);
+	s->dma = atomic64_read(&zdev->dpp_dma_irq_count);
+	s->core = atomic64_read(&zdev->dpp_core_irq_count);
+	s->valid = true;
+}
+
+static void zuma_display_log_frame(const char *phase,
+				   const struct zuma_frame_diagnostic *s)
+{
+	pr_info("zuma-display-handoff: frame diagnostic update=%llu phase=%s valid=%u frame=%#x te-raw=%#x trigger=%#x global=%#x shadow=%#x request=%#x pending=%#x extra=%#x int-en=%#x/%#x dma-enable=%#x dma-irq=%#x core-irq=%#x link=%#x mipi=%#x irq-start=%llu irq-done=%llu vblank=%llu dpp-dma=%llu dpp=%llu snapshot=non-atomic\n",
+		(unsigned long long)zuma_drm_update_count + 1, phase, s->valid,
+		s->frame, s->te, s->trigger, s->global, s->shadow, s->request,
+		s->pending, s->extra, s->int_en, s->extra_en, s->dma_enable,
+		s->dma_irq, s->core_irq, s->link, s->mipi,
+		(unsigned long long)s->start, (unsigned long long)s->done,
+		(unsigned long long)s->vblank, (unsigned long long)s->dma,
+		(unsigned long long)s->core);
+}
+
 static int zuma_display_trigger_frame(u32 *frame_before, u32 *frame_after)
 {
-	u32 value;
+	struct zuma_frame_diagnostic before = {}, after = {};
+	bool diagnose = zuma_crtc_roundtrip && zuma_drm_device &&
+		zuma_drm_update_count < 2;
+	const char *stage = "frame-counter";
+	u32 armed = 0;
+	u32 value = 0;
 	int ret;
 
 	if (zuma_drm_device &&
@@ -3525,31 +3690,53 @@ static int zuma_display_trigger_frame(u32 *frame_before, u32 *frame_after)
 		return -EIO;
 	*frame_before = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
 	*frame_after = *frame_before;
+	if (diagnose)
+		zuma_display_sample_frame(&before);
 	zuma_display_set_hw_trigger(true);
+	if (diagnose)
+		armed = readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON);
 	ret = readl_poll_timeout_atomic(zuma_decon0.base +
 			ZUMA_DECON_FRAME_COUNT, *frame_after,
 			*frame_after != *frame_before, 1, 50000);
 	zuma_display_set_hw_trigger(false);
-	if (!ret && *frame_after != *frame_before + 1)
+	value = *frame_after;
+	if (!ret && *frame_after != *frame_before + 1) {
+		stage = "frame-count-delta";
 		ret = -EIO;
+	}
 	if (ret)
-		return ret;
+		goto out;
 
-	ret = zuma_display_wait_idle();
+	ret = zuma_display_wait_idle_stage(&stage, &value);
 	if (ret)
-		return ret;
+		goto out;
 
+	stage = "shadow-drain";
 	ret = readl_poll_timeout_atomic(zuma_decon0.base +
 			ZUMA_DECON_SHD_REG_UP_REQ, value, !value,
 			10, 100000);
 	if (ret)
-		return ret;
+		goto out;
 
-	if (readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) !=
-	    ZUMA_DECON_TRIG_EXPECTED)
-		return -EIO;
+	stage = "trigger-mask";
+	value = readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON);
+	if (value != ZUMA_DECON_TRIG_EXPECTED) {
+		ret = -EIO;
+		goto out;
+	}
+	stage = "complete";
 
-	return 0;
+out:
+	/* Log only after remasking, never print while the trigger is active. */
+	if (diagnose) {
+		zuma_display_sample_frame(&after);
+		zuma_display_log_frame("before", &before);
+		zuma_display_log_frame("after", &after);
+		pr_info("zuma-display-handoff: frame diagnostic result update=%llu stage=%s ret=%d last=%#x frame=%#x->%#x trigger-armed=%#x\n",
+			(unsigned long long)zuma_drm_update_count + 1,
+			stage, ret, value, *frame_before, *frame_after, armed);
+	}
+	return ret;
 }
 
 static bool zuma_display_update_ready_for_ctrl(u32 ctrl, u32 shadow_ctrl,
@@ -4227,7 +4414,8 @@ static int zuma_drm_quiesce_irq_proof(struct zuma_drm *zdev,
 }
 
 static int zuma_drm_prepare_irq_proof(struct zuma_drm *zdev,
-				      struct zuma_drm_irq_proof *proof)
+				      struct zuma_drm_irq_proof *proof,
+				      bool crtc_restart)
 {
 	enum zuma_dpp0_irq_owner_state owner_state;
 	u32 active = zuma_decon_int_active(zdev);
@@ -4241,7 +4429,7 @@ static int zuma_drm_prepare_irq_proof(struct zuma_drm *zdev,
 	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
 		ZUMA_DECON_EXTRA_OWNED ||
 	    !zuma_decon_entry_profile_ready("proof-prepare", true) ||
-	    !zuma_decon_protected_ready(zdev))
+	    !zuma_decon_protected_ready_for_update(zdev, crtc_restart))
 		return -EIO;
 
 	ret = zuma_drm_quiesce_irq_proof(zdev, false);
@@ -4376,6 +4564,170 @@ static int zuma_drm_wait_frame_irqs(struct zuma_drm *zdev,
 	return ret;
 }
 
+static bool
+zuma_decon_crtc_counters_unchanged(struct zuma_drm *zdev,
+				   const struct zuma_drm_irq_proof *proof)
+{
+	return (u64)atomic64_read(&zdev->frame_start_irq_count) ==
+			proof->frame_start_before &&
+	       (u64)atomic64_read(&zdev->frame_done_irq_count) ==
+			proof->frame_done_before &&
+	       drm_crtc_vblank_count(&zdev->crtc) == proof->vblank_before &&
+	       (u64)atomic64_read(&zdev->dpp_dma_irq_count) == proof->dpp_dma_before &&
+	       (u64)atomic64_read(&zdev->dpp_core_irq_count) == proof->dpp_core_before;
+}
+
+/*
+ * A hardware prerequisite for CRTC ACTIVE transitions, opt-in until proven.
+ * Zuma CAL uses per-frame EN_F clear followed by GLOBAL/CMP shadow update;
+ * restart sets EN/EN_F and requests GLOBAL/CMP before enabling the trigger.
+ * Keep the panel, DSIM, clocks, DPP and window configuration running/retained.
+ * A command-mode panel may keep displaying its last image while DECON is off.
+ *
+ * Called with no outstanding per-frame vblank reference. The normal frame path
+ * following this probe must prove a real frame before publishing success.
+ */
+static int zuma_decon_crtc_roundtrip(struct zuma_drm *zdev,
+				     u32 *pending_global, u32 *resume_frame)
+{
+	struct zuma_drm_irq_proof quiet = {};
+	const char *stage = "preflight";
+	u32 frame, restarted_frame, global, pending, pll;
+	u32 dpub, dpuf0, dpuf1;
+	int ret = -EIO;
+
+	lockdep_assert_held(&zuma_display_mmio_lock);
+	*pending_global = 0;
+	*resume_frame = 0;
+	if (zdev->crtc_probe_attempted)
+		return -EALREADY;
+	zdev->crtc_probe_attempted = true;
+	if (READ_ONCE(zuma_drm_update_failed) ||
+	    !zuma_display_domains_on(&dpub, &dpuf0, &dpuf1) ||
+	    zuma_decon_irq_owner_state(zdev) != ZUMA_DECON_IRQ_OWNED ||
+	    zuma_dpp0_irq_owner_state(zdev) != ZUMA_DPP0_IRQ_OWNED ||
+	    zdev->replay_stage != ZUMA_DPP0_REPLAY_DONE ||
+	    !zdev->irq_routes_enabled || !zdev->dpp_irq_routes_enabled ||
+	    zuma_drm_irq_proof_is_armed(zdev) ||
+	    !zuma_display_update_ready_for_ctrl(zuma_framebuffer_ctrl,
+					      zuma_framebuffer_ctrl,
+					      ZUMA_DECON_INT_OWNED_QUIESCENT) ||
+	    zuma_dpp0_irq_owned_ready() || !zuma_decon_pending_zero(zdev))
+		goto out_failed;
+	pll = readl(zuma_decon0.base + ZUMA_DECON_PLL_SLEEP_CON);
+	pr_info("zuma-display-handoff: CRTC roundtrip preflight pll-sleep=%#x required-outif0-sleep=disabled\n",
+		pll);
+	if (pll & ZUMA_DECON_PLL_SLEEP_ENABLE)
+		goto out_failed;
+
+	frame = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	quiet.frame_start_before = atomic64_read(&zdev->frame_start_irq_count);
+	quiet.frame_done_before = atomic64_read(&zdev->frame_done_irq_count);
+	quiet.vblank_before = drm_crtc_vblank_count(&zdev->crtc);
+	quiet.dpp_dma_before = atomic64_read(&zdev->dpp_dma_irq_count);
+	quiet.dpp_core_before = atomic64_read(&zdev->dpp_core_irq_count);
+	pr_info("zuma-display-handoff: CRTC roundtrip begin frame=%#x global=%#x trigger=%#x reset=no\n",
+		frame, readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON),
+		readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON));
+	zuma_decon_disable_irq_routes(zdev);
+	stage = "stop";
+	zuma_display_set_hw_trigger(false);
+	global = readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON);
+	writel(global & ~ZUMA_DECON_GLOBAL_EN_F,
+	       zuma_decon0.base + ZUMA_DECON_GLOBAL_CON);
+	writel(ZUMA_DECON_SHD_REQ_GLOBAL,
+	       zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	ret = readl_poll_timeout_atomic(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON,
+					global, !(global & ZUMA_DECON_GLOBAL_RUN),
+					10, 100000);
+	pr_info("zuma-display-handoff: CRTC roundtrip stopped ret=%d global=%#x shadow=%#x request=%#x frame=%#x\n",
+		ret, global,
+		readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ),
+		readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT));
+	if (ret)
+		goto out_failed;
+	ret = -EIO;
+	/* RUN-off reads as zero; it does not retain the running frame count. */
+	if (global != (ZUMA_DECON_GLOBAL_EXPECTED &
+		       ~(ZUMA_DECON_GLOBAL_RUN | ZUMA_DECON_GLOBAL_EN_F)) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) !=
+		ZUMA_DECON_TRIG_EXPECTED ||
+	    readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT) != 0 ||
+	    !zuma_decon_crtc_counters_unchanged(zdev, &quiet) ||
+	    (readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ) &
+	     ~ZUMA_DECON_SHD_REQ_GLOBAL) ||
+	    !zuma_decon_pending_zero(zdev) || zuma_display_wait_idle() ||
+	    READ_ONCE(zuma_drm_update_failed))
+		goto out_failed;
+
+	stage = "start";
+	writel(global | ZUMA_DECON_GLOBAL_EN | ZUMA_DECON_GLOBAL_EN_F,
+	       zuma_decon0.base + ZUMA_DECON_GLOBAL_CON);
+	writel(ZUMA_DECON_SHD_REQ_GLOBAL,
+	       zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	ret = readl_poll_timeout_atomic(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON,
+					global, global & ZUMA_DECON_GLOBAL_RUN,
+					10, 2000);
+	pr_info("zuma-display-handoff: CRTC roundtrip restarted ret=%d global=%#x shadow=%#x request=%#x frame=%#x\n",
+		ret, global,
+		readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON +
+		      ZUMA_DECON_SHADOW_OFFSET),
+		readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ),
+		readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT));
+	if (ret)
+		goto out_failed;
+	ret = -EIO;
+	/* Accept a reset epoch or the exact retained count, never an advance. */
+	restarted_frame = readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT);
+	if (restarted_frame != 0 && restarted_frame != frame)
+		goto out_failed;
+	/* CAL clears a startup frame-start indication before releasing HW_TE. */
+	pending = readl(zuma_decon0.base + ZUMA_DECON_INT_PEND);
+	if (pending & ~ZUMA_DECON_INT_FRAME_START)
+		goto out_failed;
+	if (pending)
+		writel(ZUMA_DECON_INT_FRAME_START,
+		       zuma_decon0.base + ZUMA_DECON_INT_PEND);
+	*pending_global = readl(zuma_decon0.base + ZUMA_DECON_SHD_REG_UP_REQ);
+	if (global != ZUMA_DECON_GLOBAL_EXPECTED ||
+	    (*pending_global & ~ZUMA_DECON_SHD_REQ_GLOBAL) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT) != restarted_frame ||
+	    !zuma_decon_crtc_counters_unchanged(zdev, &quiet) ||
+	    !zuma_decon_protected_ready_for_update(zdev, true) ||
+	    readl(zuma_decon0.base + ZUMA_DECON_TRIG_CON) !=
+		ZUMA_DECON_TRIG_EXPECTED ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN) !=
+		ZUMA_DECON_INT_OWNED_QUIESCENT ||
+	    readl(zuma_decon0.base + ZUMA_DECON_INT_EN_EXTRA) !=
+		ZUMA_DECON_EXTRA_OWNED ||
+	    !zuma_decon_pending_zero(zdev) || zuma_dpp0_irq_owned_ready() ||
+	    zuma_display_wait_idle() || READ_ONCE(zuma_drm_update_failed))
+		goto out_failed;
+
+	zdev->irq_routes_enabled = true;
+	enable_irq(zdev->frame_done_irq);
+	enable_irq(zdev->extra_irq);
+	enable_irq(zdev->frame_start_irq);
+	if (readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT) != restarted_frame ||
+	    !zuma_decon_crtc_counters_unchanged(zdev, &quiet) ||
+	    !zuma_decon_pending_zero(zdev) ||
+	    READ_ONCE(zuma_drm_update_failed)) {
+		zuma_decon_disable_irq_routes(zdev);
+		goto out_failed;
+	}
+	*resume_frame = restarted_frame;
+	pr_info("zuma-display-handoff: CRTC counter epoch frame=%#x->%#x software-counters=unchanged\n",
+		frame, restarted_frame);
+	return 0;
+
+out_failed:
+	pr_err("zuma-display-handoff: CRTC roundtrip failed stage=%s ret=%d; no retry or reset\n",
+	       stage, ret);
+	return ret;
+}
+
 static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 					  const char *operation,
 					  bool release_after_frame)
@@ -4384,6 +4736,10 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	enum zuma_dpp0_replay_stage replay_stage = zdev->replay_stage;
 	u32 frame_before = 0, frame_after = 0;
 	u32 replay_frame = 0;
+	u32 pending_global = 0;
+	u32 resume_frame = 0;
+	bool crtc_roundtrip = zuma_crtc_roundtrip &&
+		zuma_drm_update_count == 1 && !release_after_frame;
 	bool replay_pending = replay_stage < ZUMA_DPP0_REPLAY_DONE;
 	bool replay_started = false;
 	bool lifecycle_started = false;
@@ -4411,7 +4767,12 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 		goto out_abort;
 	}
 
-	ret = zuma_drm_prepare_irq_proof(zdev, &proof);
+	if (crtc_roundtrip) {
+		ret = zuma_decon_crtc_roundtrip(zdev, &pending_global, &resume_frame);
+		if (ret)
+			goto out_abort;
+	}
+	ret = zuma_drm_prepare_irq_proof(zdev, &proof, crtc_roundtrip);
 	if (ret)
 		goto out_abort;
 	ret = drm_crtc_vblank_get(&zdev->crtc);
@@ -4441,13 +4802,30 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 		ret = -EIO;
 		goto out_abort;
 	}
-	ret = zuma_display_request_active_window();
+	if (crtc_roundtrip &&
+	    !zuma_decon_protected_ready_for_update(zdev, true)) {
+		ret = -EIO;
+		goto out_abort;
+	}
+	ret = zuma_display_request_active_window(pending_global);
 	if (ret)
 		goto out_abort;
+	if (crtc_roundtrip &&
+	    (readl(zuma_decon0.base + ZUMA_DECON_FRAME_COUNT) != resume_frame ||
+	     readl(zuma_decon0.base + ZUMA_DECON_GLOBAL_CON) !=
+		ZUMA_DECON_GLOBAL_EXPECTED)) {
+		pr_err("zuma-display-handoff: CRTC pre-trigger frame/RUN check failed; trigger withheld\n");
+		ret = -EIO;
+		goto out_abort;
+	}
 	trigger_issued = true;
 	ret = zuma_display_trigger_frame(&frame_before, &frame_after);
 	if (ret)
 		goto out_abort;
+	if (crtc_roundtrip && frame_before != resume_frame) {
+		ret = -EIO;
+		goto out_abort;
+	}
 	ret = zuma_drm_wait_frame_irqs(zdev, &proof, release_after_frame);
 	proof_sampled = true;
 	if (ret)
@@ -4499,6 +4877,9 @@ static int zuma_drm_finish_scanout_update(struct zuma_drm *zdev,
 	}
 
 	zuma_drm_update_count++;
+	if (crtc_roundtrip)
+		pr_info("zuma-display-handoff: CRTC roundtrip proven frame=%#x->%#x protected=unchanged real-frame=yes\n",
+			frame_before, frame_after);
 	if (zuma_drm_update_count <= 8) {
 		pr_info("zuma-display-handoff: DRM %s %llu bytes=0..%zu frame=%#x->%#x irq-start=%llu->%llu irq-done=%llu->%llu vblank=%llu->%llu dpp-dma=%llu->%llu dpp=%llu->%llu decon-owner=%u dpp-owner=%u\n",
 			operation, (unsigned long long)zuma_drm_update_count,
@@ -4630,14 +5011,31 @@ static size_t zuma_drm_copy_damage(struct drm_framebuffer *fb,
 	    damage->x2 == ZUMA_HANDOFF_FB_WIDTH &&
 	    damage->y2 == ZUMA_HANDOFF_FB_HEIGHT) {
 		zuma_drm_copy_shadow(fb, source);
-		return ZUMA_HANDOFF_FB_SIZE;
+	} else {
+		for (y = damage->y1; y < damage->y2; y++)
+			iosys_map_memcpy_from((u8 *)zuma_scanout_buffer +
+					      (size_t)y * ZUMA_HANDOFF_FB_STRIDE + x,
+					      source, (size_t)y * fb->pitches[0] + x,
+					      row_bytes);
 	}
 
-	for (y = damage->y1; y < damage->y2; y++)
-		iosys_map_memcpy_from((u8 *)zuma_scanout_buffer +
-				      (size_t)y * ZUMA_HANDOFF_FB_STRIDE + x,
-				      source, (size_t)y * fb->pitches[0] + x,
-				      row_bytes);
+	/*
+	 * Shadow data already includes the framebuffer offset. Keep I/O-safe
+	 * source reads above; conversion touches only the copied destination.
+	 * These little-endian formats differ only in red/blue byte placement.
+	 * The inherited scanout ignores the fourth byte, including input alpha.
+	 */
+	if (fb->format->format == DRM_FORMAT_XBGR8888 ||
+	    fb->format->format == DRM_FORMAT_ABGR8888) {
+		for (y = damage->y1; y < damage->y2; y++) {
+			u8 *row = (u8 *)zuma_scanout_buffer +
+				  (size_t)y * ZUMA_HANDOFF_FB_STRIDE + x;
+			size_t i;
+
+			for (i = 0; i < row_bytes; i += sizeof(u32))
+				swap(row[i], row[i + 2]);
+		}
+	}
 
 	return row_bytes * drm_rect_height(damage);
 }
@@ -5184,7 +5582,7 @@ static int __init zuma_display_commit_base(phys_addr_t base,
 	    lower_32_bits(base))
 		return -EIO;
 
-	ret = zuma_display_request_active_window();
+	ret = zuma_display_request_active_window(0);
 	if (ret)
 		return ret;
 
@@ -5231,7 +5629,7 @@ static int zuma_display_commit_format(u32 format, u32 *ctrl_after,
 	if (ret)
 		return ret;
 
-	ret = zuma_display_request_active_window();
+	ret = zuma_display_request_active_window(0);
 	if (ret)
 		return ret;
 
