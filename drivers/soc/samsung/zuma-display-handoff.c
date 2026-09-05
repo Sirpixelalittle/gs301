@@ -39,6 +39,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_encoder.h>
@@ -487,6 +488,8 @@ struct zuma_drm {
 	/* Serializes nonblocking queue admission with reboot shutdown. */
 	struct mutex commit_admission_lock;
 	struct notifier_block reboot_notifier;
+	/* Physical shadow matches the preceding commit; protected by MMIO lock. */
+	bool shadow_valid;
 };
 
 struct zuma_drm_irq_proof {
@@ -4595,14 +4598,69 @@ static void zuma_drm_copy_shadow(struct drm_framebuffer *fb,
 				      ZUMA_HANDOFF_FB_STRIDE);
 }
 
+static bool zuma_drm_plane_damage(const struct drm_plane_state *old_state,
+				  const struct drm_plane_state *new_state,
+				  bool shadow_valid, struct drm_rect *damage)
+{
+	struct drm_rect full = DRM_RECT_INIT(0, 0, ZUMA_HANDOFF_FB_WIDTH,
+					   ZUMA_HANDOFF_FB_HEIGHT);
+
+	/* Atomic state can advance without a frame after a producer failure. */
+	if (!shadow_valid || !old_state || old_state->fb != new_state->fb ||
+	    old_state->crtc != new_state->crtc) {
+		*damage = full;
+		return true;
+	}
+
+	if (!drm_atomic_helper_damage_merged(old_state, new_state, damage))
+		return false;
+
+	return drm_rect_intersect(damage, &full);
+}
+
+static size_t zuma_drm_copy_damage(struct drm_framebuffer *fb,
+				   const struct iosys_map *source,
+				   const struct drm_rect *damage)
+{
+	size_t row_bytes = (size_t)drm_rect_width(damage) * sizeof(u32);
+	size_t x = (size_t)damage->x1 * sizeof(u32);
+	int y;
+
+	if (!damage->x1 && !damage->y1 &&
+	    damage->x2 == ZUMA_HANDOFF_FB_WIDTH &&
+	    damage->y2 == ZUMA_HANDOFF_FB_HEIGHT) {
+		zuma_drm_copy_shadow(fb, source);
+		return ZUMA_HANDOFF_FB_SIZE;
+	}
+
+	for (y = damage->y1; y < damage->y2; y++)
+		iosys_map_memcpy_from((u8 *)zuma_scanout_buffer +
+				      (size_t)y * ZUMA_HANDOFF_FB_STRIDE + x,
+				      source, (size_t)y * fb->pitches[0] + x,
+				      row_bytes);
+
+	return row_bytes * drm_rect_height(damage);
+}
+
+static void zuma_drm_invalidate_shadow(struct zuma_drm *zdev)
+{
+	mutex_lock(&zuma_display_mmio_lock);
+	zdev->shadow_valid = false;
+	mutex_unlock(&zuma_display_mmio_lock);
+}
+
 static int zuma_drm_commit_shadow(struct drm_atomic_commit *state,
 				  bool *fail_closed)
 {
 	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
 	struct drm_shadow_plane_state *shadow_plane_state;
+	struct drm_plane_state *old_plane_state;
 	struct drm_plane_state *new_plane_state;
 	struct drm_crtc_state *new_crtc_state;
 	struct drm_framebuffer *fb;
+	struct drm_rect damage = { };
+	size_t copied = 0;
+	bool has_damage;
 	int ret;
 
 	if (fail_closed)
@@ -4621,10 +4679,14 @@ static int zuma_drm_commit_shadow(struct drm_atomic_commit *state,
 		return 0;
 
 	fb = new_plane_state->fb;
+	old_plane_state =
+		drm_atomic_get_old_plane_state(state, &zdev->primary_plane);
 	shadow_plane_state = to_drm_shadow_plane_state(new_plane_state);
 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
-	if (ret)
+	if (ret) {
+		zuma_drm_invalidate_shadow(zdev);
 		return ret;
+	}
 
 	mutex_lock(&zuma_display_mmio_lock);
 	if (!zuma_drm_scanout_update_ready()) {
@@ -4636,8 +4698,23 @@ static int zuma_drm_commit_shadow(struct drm_atomic_commit *state,
 
 	if (fail_closed)
 		*fail_closed = true;
-	zuma_drm_copy_shadow(fb, &shadow_plane_state->data[0]);
+	has_damage = zuma_drm_plane_damage(old_plane_state, new_plane_state,
+					   zdev->shadow_valid, &damage);
+	zdev->shadow_valid = false;
+	if (has_damage)
+		copied = zuma_drm_copy_damage(fb, &shadow_plane_state->data[0],
+					      &damage);
+	else
+		memset(&damage, 0, sizeof(damage));
+	/* Even empty damage retains the real-frame event/out-fence contract. */
 	ret = zuma_drm_finish_scanout_update(zdev, "shadow update", false);
+	if (!ret) {
+		zdev->shadow_valid = true;
+		if (zuma_drm_update_count <= 8)
+			pr_info("zuma-display-handoff: DRM shadow copy %llu bytes=%zu rect=%d,%d..%d,%d\n",
+				(unsigned long long)zuma_drm_update_count, copied,
+				damage.x1, damage.y1, damage.x2, damage.y2);
+	}
 
 out_unlock:
 	mutex_unlock(&zuma_display_mmio_lock);
@@ -4652,6 +4729,7 @@ static int zuma_drm_restore_boot_buffer(struct zuma_drm *zdev)
 	int ret;
 
 	mutex_lock(&zuma_display_mmio_lock);
+	zdev->shadow_valid = false;
 	if (!zuma_drm_scanout_update_ready()) {
 		ret = -EIO;
 		goto out_unlock;
@@ -4678,6 +4756,64 @@ out_unlock:
 	return ret;
 }
 
+static bool zuma_drm_restore_boot_requested(struct drm_atomic_commit *state)
+{
+	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
+	struct drm_plane_state *old_plane_state;
+	struct drm_plane_state *new_plane_state;
+
+	old_plane_state =
+		drm_atomic_get_old_plane_state(state, &zdev->primary_plane);
+	new_plane_state =
+		drm_atomic_get_new_plane_state(state, &zdev->primary_plane);
+
+	return old_plane_state && old_plane_state->fb &&
+		new_plane_state && !new_plane_state->fb;
+}
+
+static int zuma_drm_commit_scanout(struct drm_atomic_commit *state,
+				   bool *fail_closed)
+{
+	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
+
+	if (zuma_drm_restore_boot_requested(state)) {
+		/* A restore failure must never be treated as a producer rejection. */
+		if (fail_closed)
+			*fail_closed = true;
+		return zuma_drm_restore_boot_buffer(zdev);
+	}
+
+	return zuma_drm_commit_shadow(state, fail_closed);
+}
+
+static int zuma_drm_commit_supported(struct drm_atomic_commit *state,
+				     bool nonblock)
+{
+	struct zuma_drm *zdev = container_of(state->dev, struct zuma_drm, drm);
+	struct drm_plane_state *new_plane_state;
+	struct drm_crtc_state *old_crtc_state;
+	struct drm_crtc_state *new_crtc_state;
+
+	new_plane_state =
+		drm_atomic_get_new_plane_state(state, &zdev->primary_plane);
+	if (!zuma_drm_restore_boot_requested(state) &&
+	    !(new_plane_state && new_plane_state->crtc && new_plane_state->fb))
+		return -EOPNOTSUPP;
+
+	if (!nonblock)
+		return 0;
+
+	old_crtc_state = drm_atomic_get_old_crtc_state(state, &zdev->crtc);
+	new_crtc_state = drm_atomic_get_new_crtc_state(state, &zdev->crtc);
+	/* Plane detach/reattach is allowed; CRTC bring-up or modesetting is not. */
+	if (!old_crtc_state || !old_crtc_state->enable || !old_crtc_state->active ||
+	    !new_crtc_state || !new_crtc_state->enable || !new_crtc_state->active ||
+	    drm_atomic_crtc_needs_modeset(new_crtc_state))
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static int zuma_drm_reboot_notifier(struct notifier_block *notifier,
 				    unsigned long action, void *data)
 {
@@ -4692,6 +4828,7 @@ static int zuma_drm_reboot_notifier(struct notifier_block *notifier,
 	flush_workqueue(zdev->workqueue);
 
 	mutex_lock(&zuma_display_mmio_lock);
+	zdev->shadow_valid = false;
 	decon_ret = zuma_decon_shutdown_restore(zdev);
 	dpp_ret = zuma_dpp0_irq_restore(zdev);
 	mutex_unlock(&zuma_display_mmio_lock);
@@ -4885,7 +5022,10 @@ static void zuma_drm_commit_work(struct work_struct *work)
 	ret = zuma_drm_wait_for_fences(state, false);
 	drm_atomic_helper_wait_for_dependencies(state);
 	if (!ret)
-		ret = zuma_drm_commit_shadow(state, &fail_closed);
+		ret = zuma_drm_commit_scanout(state, &fail_closed);
+	/* Invalidate before completing a rejected commit's event/dependencies. */
+	if (ret)
+		zuma_drm_invalidate_shadow(zdev);
 	if (ret && (fail_closed || READ_ONCE(zuma_drm_update_failed))) {
 		WRITE_ONCE(zuma_drm_update_failed, true);
 		mutex_lock(&zuma_display_mmio_lock);
@@ -4910,38 +5050,16 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 				  bool nonblock)
 {
 	struct zuma_drm *zdev = container_of(drm, struct zuma_drm, drm);
-	struct drm_plane_state *old_plane_state;
-	struct drm_plane_state *new_plane_state;
-	struct drm_crtc_state *new_crtc_state;
-	bool restore_boot;
-	bool update_scanout;
 	bool admission_locked = false;
 	int decon_ret;
 	int dpp_ret;
 	int ret;
 
-	old_plane_state =
-		drm_atomic_get_old_plane_state(state, &zdev->primary_plane);
-	new_plane_state =
-		drm_atomic_get_new_plane_state(state, &zdev->primary_plane);
-	restore_boot = old_plane_state && old_plane_state->fb &&
-		new_plane_state && !new_plane_state->fb;
-	update_scanout = restore_boot ||
-		(new_plane_state && new_plane_state->crtc &&
-		 new_plane_state->fb);
-	if (!update_scanout)
-		return -EOPNOTSUPP;
+	ret = zuma_drm_commit_supported(state, nonblock);
+	if (ret)
+		return ret;
 	if (READ_ONCE(zuma_drm_update_failed))
 		return -EIO;
-
-	new_crtc_state =
-		drm_atomic_get_new_crtc_state(state, &zdev->crtc);
-	if (nonblock &&
-	    (!old_plane_state || !old_plane_state->crtc ||
-	     !old_plane_state->fb || restore_boot || !new_plane_state ||
-	     !new_plane_state->crtc || !new_plane_state->fb ||
-	     !new_crtc_state || drm_atomic_crtc_needs_modeset(new_crtc_state)))
-		return -EOPNOTSUPP;
 
 	ret = drm_atomic_helper_setup_commit(state, nonblock);
 	if (ret)
@@ -4983,10 +5101,7 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 		goto out_unprepare;
 	drm_atomic_helper_wait_for_dependencies(state);
 
-	if (restore_boot)
-		ret = zuma_drm_restore_boot_buffer(zdev);
-	else
-		ret = zuma_drm_commit_shadow(state, NULL);
+	ret = zuma_drm_commit_scanout(state, NULL);
 	if (ret)
 		goto out_unprepare;
 
@@ -5011,6 +5126,7 @@ static int zuma_drm_atomic_commit(struct drm_device *drm,
 	return 0;
 
 out_unprepare:
+	zuma_drm_invalidate_shadow(zdev);
 	if (admission_locked)
 		mutex_unlock(&zdev->commit_admission_lock);
 	drm_atomic_helper_unprepare_planes(drm, state);
